@@ -1,0 +1,170 @@
+---
+title: Local Postgres with Docker
+desc: spin up, connect, migrate
+tag: docker
+---
+
+# Local Postgres with Docker
+
+// no more installing postgres directly on your machine
+
+## why docker for local db
+
+Run Postgres in a container. Blow it away anytime. No mess on your system. Every project can have its own isolated db with different versions if needed.
+
+## prerequisites
+
+Install golang-migrate CLI — it's a global binary, not a go package so it won't be in go.mod:
+
+```bash
+go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+migrate -version
+```
+
+## spin up the container
+
+```bash
+docker run --name postgres-dev \
+  -e POSTGRES_PASSWORD='yourpass' \
+  -e POSTGRES_USER=youruser \
+  -e POSTGRES_DB=yourdb \
+  -p 5432:5432 \
+  -d postgres
+```
+
+what each flag does:
+
+- `--name` — give it a name so you reference it by name not a random ID
+- `-e` — pass environment variables into the container
+- `-p 5432:5432` — map your machine port to container port. format is `your machine : container`
+- `-d` — detached, runs in background so it doesn't hijack your terminal
+- `postgres` — image pulled from Docker Hub automatically if not local
+
+**wrap passwords containing `$` in single quotes** — shell treats `$` as variable expansion in double quotes, single quotes prevent that.
+
+## database url
+
+```env
+DATABASE_URL="postgres://youruser:yourpass@localhost:5432/yourdb?sslmode=disable"
+```
+
+`?sslmode=disable` is required for local Docker Postgres — it has no SSL so without this your connections will fail.
+
+## makefile setup
+
+Add these two lines at the top of your Makefile so it auto-reads your `.env`:
+
+```makefile
+include .env
+export
+```
+
+Then run migrations:
+
+```bash
+make migrate-up    # runs all pending .up.sql files in order
+make migrate-down  # rolls back one step
+```
+
+## how migrations work
+
+golang-migrate runs all `.up.sql` files in order based on the number prefix:
+
+```
+0001_create_users.up.sql     ← runs first
+0002_create_todos.up.sql     ← runs second
+0003_create_orders.up.sql    ← runs third
+```
+
+it tracks which ones already ran in a `schema_migrations` table it creates automatically. re-running `make migrate-up` only runs new migrations, never re-runs old ones.
+
+every `.up.sql` needs a matching `.down.sql` — that's your undo button.
+
+## useful docker commands
+
+```bash
+docker ps                    # running containers
+docker ps -a                 # all containers including stopped
+docker stop postgres-dev     # stop container
+docker start postgres-dev    # start it again
+docker rm -f postgres-dev    # force remove (no need to stop first)
+docker logs postgres-dev     # see what's happening inside
+docker images                # list locally downloaded images
+```
+
+## port already in use?
+
+If port 5432 is taken (you have local Postgres running):
+
+```bash
+sudo lsof -i :5432           # see what's using it
+sudo systemctl stop postgresql   # stop local postgres
+```
+
+or just use a different port on your machine side:
+
+```bash
+-p 5433:5432
+```
+
+then your DATABASE_URL becomes `localhost:5433`.
+
+## docker-compose
+
+Instead of typing that long `docker run` command every time, define it in a file and just do `docker compose up`. Commit this to your repo so anyone cloning can spin up the same db with one command.
+
+Create `docker-compose.yml` in your project root:
+
+```yaml
+services:
+  db:
+    image: postgres
+    container_name: postgres-dev
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+```
+
+values come from your `.env` file — nothing hardcoded, nothing exposed.
+
+then:
+
+```bash
+docker compose up -d    # start in background
+docker compose down     # stop and remove
+```
+
+**what to commit:**
+
+- `docker-compose.yml` — yes, no secrets, just structure
+- `.env` — no, has actual passwords
+- `.env.example` — yes, template with empty values so others know what vars they need
+
+```bash
+# .env.example
+DATABASE_URL=
+POSTGRES_USER=
+POSTGRES_PASSWORD=
+POSTGRES_DB=
+```
+
+## viewing tables
+
+Use **TablePlus** — run it as an AppImage on Linux:
+
+```bash
+~/Applications/TablePlus-x64.AppImage
+```
+
+connect with:
+
+- **Host** `127.0.0.1`
+- **Port** `5432`
+- **User** your POSTGRES_USER
+- **Password** your POSTGRES_PASSWORD
+- **Database** your POSTGRES_DB
+
+same experience as Neon or Supabase, just pointing to local instead of cloud.
