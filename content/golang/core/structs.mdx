@@ -1,0 +1,259 @@
+---
+title: structs
+desc: go's way of modeling data. no classes, no inheritance. just fields, methods, and embedding. think typescript types but compiled and strict.
+tag: go
+---
+
+structs group related data together. no classes, no inheritance — just data and the functions that work on it. every model in your gin api (`Todo`, `User`, request/response bodies) is a struct.
+
+```go
+// typescript
+type User = { name: string; email: string }
+
+// go
+type User struct {
+    Name  string
+    Email string
+}
+```
+
+## exported vs unexported fields
+
+capitalized = exported (public, accessible from other packages).
+lowercase = unexported (private, only accessible within the same package).
+
+this applies to everything in go — fields, methods, functions, types. not just structs.
+
+```go
+type ServerConfig struct {
+    Host      string // exported — other packages can read/write
+    Port      int    // exported
+    secretKey string // unexported — internal use only
+}
+```
+
+## declaring structs — three ways
+
+```go
+// named fields — always use this in real code
+config := &ServerConfig{
+    Host: "localhost",
+    Port: 8080,
+}
+
+// positional — breaks if struct fields change order, avoid
+config := &ServerConfig{"localhost", 8080}
+
+// zero value then assign
+var config ServerConfig
+config.Host = "localhost"
+config.Port = 8080
+```
+
+zero value of a struct = zero value of each field. `string` fields are `""`, `int` fields are `0`, `bool` fields are `false`.
+
+## methods — attaching functions to structs
+
+```go
+// value receiver — works on a copy, doesn't modify original
+func (sc ServerConfig) Address() string {
+    return fmt.Sprintf("%s:%d", sc.Host, sc.Port)
+}
+
+// pointer receiver — works on original, modifications stick
+func (sc *ServerConfig) SetHost(host string) {
+    sc.Host = host // modifies the original struct
+}
+```
+
+**value vs pointer receiver — when to use which:**
+
+```go
+// value receiver — for reads, small structs, computed properties
+func (u User) IsAdmin() bool       { return u.Role == "admin" }
+func (t Todo) Summary() string     { return t.Title }
+func (s ServerConfig) IsValid() bool { return s.Host != "" && s.Port > 0 }
+
+// pointer receiver — for writes, large structs, anything that changes state
+func (u *User) UpdateEmail(email string)  { u.Email = email }
+func (t *Todo) MarkComplete()             { t.Completed = true }
+func (s *Server) IncrementConnections()   { s.connections++ }
+```
+
+rule of thumb — when in doubt, use pointer receiver. go auto-dereferences so `c.PointerMethod()` works even if `c` is a value, not a pointer.
+
+always nil-check at the top of pointer receiver methods:
+
+```go
+func (sc *ServerConfig) IsValid() bool {
+    if sc == nil {
+        return false
+    }
+    return sc.Host != "" && sc.Port > 0
+}
+```
+
+## value type vs pointer — when to use &
+
+```go
+// value — no &
+// go creates a copy when passing around
+// use for: small structs, temporary use, read-only
+
+config := ServerConfig{Host: "localhost", Port: 8080}
+
+// pointer — with &
+// go passes the address, no copy
+// use for: large structs, passed through multiple layers, needs mutation
+// in backends: db models, request/response structs — always &
+
+config := &ServerConfig{Host: "localhost", Port: 8080}
+```
+
+think 1000 todos from a db — copying each one through handler, service, repository layers is slow. passing the pointer address is instant.
+
+## dereferencing
+
+```go
+res := &UserResponse{Name: "alice"} // & = take the address, res is *UserResponse
+
+actual := *res     // * = get the value at that address (explicit deref)
+fmt.Println(actual) // UserResponse{Name: "alice"}
+
+// go auto-dereferences when accessing fields
+res.Name           // go does (*res).Name under the hood — implicit deref
+                   // every res.Field on a pointer is auto-dereferencing
+```
+
+## struct tags — json, db, validation
+
+```go
+type CreateUserRequest struct {
+    Name     string `json:"name"`
+    Email    string `json:"email"`
+    Password string `json:"-"`                // never included in json output
+    Token    string `json:"token,omitempty"`  // omitted if empty string
+    Role     string `json:"role"`
+}
+```
+
+- `json:"name"` — key name in json output
+- `json:"-"` — always excluded regardless of value (use for passwords, secrets)
+- `json:"field,omitempty"` — excluded if zero/empty (like typescript optional `field?`)
+- `db:"column_name"` — maps to database column (used by gorm, sqlx)
+
+```go
+import "encoding/json"
+
+res := &UserResponse{Name: "alice", Password: "secret"}
+out, _ := json.Marshal(res)
+fmt.Println(string(out)) // password field absent from output
+```
+
+## struct embedding — go's answer to inheritance
+
+embed one struct inside another — fields and methods are promoted to the outer struct.
+
+```go
+type BaseModel struct {
+    ID        int
+    CreatedAt time.Time
+    UpdatedAt time.Time
+}
+
+func (b *BaseModel) Age() string {
+    return b.CreatedAt.String()
+}
+
+type Post struct {
+    BaseModel        // embedded — no field name
+    Title    string
+    Content  string
+    AuthorID int
+}
+
+// when initializing — must name the embedded struct explicitly
+post := &Post{
+    BaseModel: BaseModel{
+        ID:        1,
+        CreatedAt: time.Now(),
+    },
+    Title:    "hello go",
+    AuthorID: 7,
+}
+
+// accessing — fields and methods are promoted
+fmt.Println(post.ID)        // promoted from BaseModel, not post.BaseModel.ID
+fmt.Println(post.CreatedAt) // promoted
+fmt.Println(post.Age())     // method promoted from BaseModel
+```
+
+## real world — todo api structs
+
+```go
+type Todo struct {
+    ID          string    `json:"id"`
+    Title       string    `json:"title"`
+    Description string    `json:"description"`
+    Completed   bool      `json:"completed"`
+    CreatedAt   time.Time `json:"createdAt"`
+    UserID      string    `json:"userId"`
+}
+
+type CreateTodoRequest struct {
+    Title       string `json:"title"`
+    Description string `json:"description"`
+}
+
+type TodoResponse struct {
+    Success bool   `json:"success"`
+    Message string `json:"message"`
+    Todo    *Todo  `json:"todo,omitempty"`
+}
+
+func NewTodo(req *CreateTodoRequest, userID string) *Todo {
+    return &Todo{
+        ID:          "todo_1",
+        Title:       req.Title,
+        Description: req.Description,
+        Completed:   false,
+        UserID:      userID,
+        CreatedAt:   time.Now(),
+    }
+}
+
+func ToResponse(t *Todo) *TodoResponse {
+    return &TodoResponse{
+        Success: true,
+        Message: "todo created successfully",
+        Todo:    t,
+    }
+}
+```
+
+## gotchas
+
+```go
+// positional init breaks when struct changes
+type User struct { Name, Email string }
+u := User{"alice", "alice@example.com"} // ok
+
+// add a field
+type User struct { Name, Email, Role string }
+u := User{"alice", "alice@example.com"} // compile error — not enough values
+// named init would still work fine
+
+// nil pointer dereference
+var sc *ServerConfig
+sc.IsValid() // panic — sc is nil, no ServerConfig in memory
+
+// fix — nil check inside the method
+func (sc *ServerConfig) IsValid() bool {
+    if sc == nil { return false }
+    ...
+}
+
+// variable shadowing built-ins
+copy := original // copy is a built-in function — shadows it in this scope
+copied := original // use a different name
+```

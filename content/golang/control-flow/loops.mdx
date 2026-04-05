@@ -1,0 +1,163 @@
+---
+title: looping
+desc: go has one loop keyword — for. no while, no do-while. but for is flexible enough to do everything. range is your best friend for collections.
+tag: go
+---
+
+go has exactly one loop keyword: `for`. it covers classic for, while, and infinite loops. less to remember, same power.
+
+## classic for loop
+
+same as js minus the parentheses.
+
+```go
+// js
+for (let i = 0; i < 5; i++) { }
+
+// go — no parentheses
+for i := 0; i < 5; i++ {
+    fmt.Printf("fetching page %d...\n", i+1)
+}
+```
+
+## for as while
+
+condition only — no init, no post.
+
+```go
+attempt    := 0
+maxRetries := 5
+
+for attempt < maxRetries {
+    attempt++
+    fmt.Printf("attempt %d failed, retrying...\n", attempt)
+}
+fmt.Println("max retries reached")
+```
+
+don't mutate your config values inside the loop. loop on a separate counter — `maxRetries` should still be 5 after the loop for reference.
+
+## infinite loop
+
+no condition at all. equivalent to `while (true)` in js.
+
+```go
+requestCount := 0
+
+for {
+    if requestCount >= 5 { // use >= not == — safer
+        break
+    }
+    fmt.Printf("processing request %d\n", requestCount+1)
+    requestCount++
+}
+fmt.Println("server shutting down")
+```
+
+use `>=` not `==` for exit conditions. if the counter somehow skips your exact value (e.g. jumps from 4 to 6), `==` never triggers and you have an infinite loop.
+
+## break vs return vs labeled break
+
+```go
+// break — exits the innermost loop only
+for i := 0; i < 3; i++ {
+    for j := 0; j < 3; j++ {
+        if j == 1 {
+            break // exits inner loop, outer continues
+        }
+        fmt.Printf("page %d item %d\n", i, j)
+    }
+}
+
+// return — exits the entire function, always, no exceptions
+for {
+    if done {
+        return // nothing after this runs in the function
+    }
+}
+
+// labeled break — exits a specific outer loop
+outer:
+    for i := 0; i < 3; i++ {
+        for j := 0; j < 3; j++ {
+            if j == 1 {
+                break outer // exits the outer loop
+            }
+        }
+    }
+fmt.Println("this runs after labeled break") // return would have killed this
+```
+
+## continue
+
+skips the rest of the current iteration, moves to the next.
+
+```go
+bannedID := 3
+
+for i := 1; i <= 7; i++ {
+    if i == bannedID {
+        continue // skip banned user
+    }
+    fmt.Printf("processing user %d\n", i)
+}
+```
+
+## for range
+
+range iterates over collections — slices, arrays, maps, strings, channels.
+
+```go
+routes := []string{"/health", "/users", "/posts", "/auth"}
+
+// both index and value
+for i, v := range routes {
+    fmt.Printf("%d: %s\n", i, v)
+}
+
+// index only — valid without _
+for i := range routes {
+    fmt.Println(i)
+}
+
+// value only — discard index with _
+for _, v := range routes {
+    fmt.Println(v)
+}
+```
+
+you cannot do `for v := range slice` alone — range on a slice always returns index first, value second. if you name only one, go assumes it's the index.
+
+## gotchas
+
+```go
+// expr+1 is temporary — doesn't mutate
+fmt.Printf("%d\n", requestCount+1) // requestCount unchanged
+
+// requestCount++ mutates
+requestCount++ // this changes the actual variable
+
+// these are not the same thing — order inside loops matters
+for {
+    if requestCount == 5 {
+        break
+    }
+    fmt.Printf("processing request %d\n", requestCount+1)
+    requestCount++
+}
+// when requestCount is 4:
+// check: 4 == 5? no
+// print: "processing request 5" (4+1)
+// increment: requestCount = 5
+// check: 5 == 5? yes — break
+// "processing request 5" prints before the break — not after
+
+// declare i, v but not use i — compile error
+for i, v := range routes {
+    fmt.Println(v) // i declared but not used — won't compile
+}
+// fix
+for _, v := range routes {
+    fmt.Println(v)
+}
+```

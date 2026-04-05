@@ -1,0 +1,299 @@
+---
+title: interfaces
+desc: interfaces define behavior, not data. implicit implementation — if your struct has the methods, it satisfies the interface automatically. no implements keyword.
+tag: go
+---
+
+interfaces define a set of methods a type must have. if your struct has those methods, it satisfies the interface — no declaration needed. this is called implicit implementation and it's one of go's best features.
+
+```go
+// java/ts — explicit
+class Rectangle implements Shape { }
+
+// go — implicit
+// if Rectangle has Area() and Perimeter(), it satisfies Shape automatically
+// no `implements Shape` anywhere
+```
+
+## defining and implementing
+
+```go
+type Shape interface {
+    Area() float64
+    Perimeter() float64
+}
+
+type Rectangle struct { Length, Breadth float64 }
+type Circle struct    { Radius float64 }
+
+func (r *Rectangle) Area() float64      { return r.Length * r.Breadth }
+func (r *Rectangle) Perimeter() float64 { return 2 * (r.Length + r.Breadth) }
+func (c *Circle) Area() float64         { return math.Pi * math.Pow(c.Radius, 2) }
+func (c *Circle) Perimeter() float64    { return 2 * math.Pi * c.Radius }
+
+// one function works for any type that satisfies Shape
+// add Triangle, Hexagon, whatever — this function never changes
+func printShapeInfo(s Shape) {
+    fmt.Printf("area: %.2f, perimeter: %.2f\n", s.Area(), s.Perimeter())
+}
+
+printShapeInfo(&Rectangle{Length: 4, Breadth: 5})
+printShapeInfo(&Circle{Radius: 4})
+```
+
+if you add a new method to `Shape` without implementing it on `Rectangle` and `Circle` — compile error immediately. go enforces the full contract.
+
+## the stringer interface — built into fmt
+
+```go
+// defined in the fmt package
+type Stringer interface {
+    String() string
+}
+```
+
+if your struct implements `String() string`, `fmt.Println` calls it automatically. fmt knows nothing about your struct — but because it has `String()`, fmt uses it.
+
+```go
+type ServerConfig struct {
+    Host    string
+    Port    int
+    IsHTTPS bool
+}
+
+func (sc *ServerConfig) String() string {
+    return fmt.Sprintf("%s:%d (https: %t)", sc.Host, sc.Port, sc.IsHTTPS)
+}
+
+sc := &ServerConfig{Host: "localhost", Port: 8080}
+fmt.Println(sc) // localhost:8080 (https: false) — String() called automatically
+```
+
+## interfaces as function parameters
+
+```go
+type Notifier interface {
+    Send(message string) error
+    Channel() string
+}
+
+type EmailNotifier struct{ recipient string }
+type SMSNotifier   struct{ phoneNumber string }
+type SlackNotifier struct{ webhook string }
+
+func (e *EmailNotifier) Send(msg string) error {
+    fmt.Printf("[email] to %s: %s\n", e.recipient, msg)
+    return nil
+}
+func (e *EmailNotifier) Channel() string { return "email" }
+
+func (s *SMSNotifier) Send(msg string) error {
+    fmt.Printf("[sms] to %s: %s\n", s.phoneNumber, msg)
+    return nil
+}
+func (s *SMSNotifier) Channel() string { return "sms" }
+
+func (s *SlackNotifier) Send(msg string) error {
+    fmt.Printf("[slack] to %s: %s\n", s.webhook, msg)
+    return nil
+}
+func (s *SlackNotifier) Channel() string { return "slack" }
+
+// works for email, sms, slack, or any future notifier you add
+func notifyAll(notifiers []Notifier, msg string) {
+    for _, n := range notifiers {
+        n.Send(msg)
+    }
+}
+
+notifiers := []Notifier{
+    &EmailNotifier{recipient: "alice@example.com"},
+    &SMSNotifier{phoneNumber: "+9779800000000"},
+    &SlackNotifier{webhook: "https://hooks.slack.com/abc"},
+}
+notifyAll(notifiers, "system maintenance at midnight")
+```
+
+## interface composition
+
+interfaces can embed other interfaces — builds larger contracts from smaller ones.
+
+```go
+type Reader interface { Read() string }
+type Writer interface { Write(data string) error }
+type Closer interface { Close() }
+
+// requires all methods from Reader + Writer + Closer
+type ReadWriteCloser interface {
+    Reader
+    Writer
+    Closer
+}
+
+type FileStorage   struct{ Name string }
+type MemoryStorage struct{ data string }
+
+// FileStorage implements all three — satisfies ReadWriteCloser
+func (fs *FileStorage) Read() string           { return "reading from " + fs.Name }
+func (fs *FileStorage) Write(data string) error { fmt.Println("writing to", fs.Name); return nil }
+func (fs *FileStorage) Close()                  { fmt.Println("closing", fs.Name) }
+
+// MemoryStorage also satisfies ReadWriteCloser
+func (ms *MemoryStorage) Read() string           { return "reading from memory: " + ms.data }
+func (ms *MemoryStorage) Write(data string) error { ms.data = data; return nil }
+func (ms *MemoryStorage) Close()                  { ms.data = "" }
+
+func useStorage(rwc ReadWriteCloser, data string) {
+    rwc.Write(data)
+    fmt.Println(rwc.Read())
+    rwc.Close()
+}
+
+useStorage(&FileStorage{Name: "data.txt"}, "hello file")
+useStorage(&MemoryStorage{}, "hello memory")
+```
+
+## type assertion
+
+get the concrete type back out of an interface value. always use comma ok — panics without it if type is wrong.
+
+```go
+var n Notifier = &EmailNotifier{recipient: "test@example.com"}
+
+// safe — comma ok pattern
+if email, ok := n.(*EmailNotifier); ok {
+    fmt.Println("recipient:", email.recipient) // can access EmailNotifier fields
+}
+
+// unsafe — panics if wrong type
+email := n.(*EmailNotifier) // panics if n is not *EmailNotifier
+```
+
+## type switch
+
+check multiple concrete types at once. use `v := n.(type)` to get the concrete value — lets you access type-specific fields.
+
+```go
+func describeNotifier(n Notifier) {
+    switch v := n.(type) {
+    case *EmailNotifier:
+        fmt.Println("email to:", v.recipient)   // v is *EmailNotifier here
+    case *SMSNotifier:
+        fmt.Println("sms to:", v.phoneNumber)   // v is *SMSNotifier here
+    case *SlackNotifier:
+        fmt.Println("slack to:", v.webhook)     // v is *SlackNotifier here
+    default:
+        fmt.Println("unknown notifier")
+    }
+}
+
+// without v — you can match but can't access type-specific fields
+switch n.(type) {
+case *EmailNotifier:
+    fmt.Println("email") // can't access .recipient here
+}
+```
+
+## empty interface — interface{} / any
+
+accepts any type. like typescript's `any`. use sparingly — you lose type safety.
+
+```go
+// any and interface{} are identical — any is just an alias (go 1.18+)
+type APIResponse struct {
+    Success bool        `json:"success"`
+    Message string      `json:"message"`
+    Data    interface{} `json:"data,omitempty"` // can hold Todo, []string, nil — anything
+}
+
+func respond(success bool, message string, data interface{}) *APIResponse {
+    return &APIResponse{Success: success, Message: message, Data: data}
+}
+
+// same function handles all of these
+respond(true,  "todo fetched",    &Todo{ID: "1", Title: "learn go"})
+respond(true,  "routes fetched",  []string{"/users", "/posts"})
+respond(false, "not found",       nil) // Data omitted — omitempty + nil
+```
+
+## real world use case — dependency injection
+
+the pattern you'd use in a real go backend:
+
+```go
+// instead of coupling handlers directly to gorm
+type TodoRepository interface {
+    GetAll() ([]Todo, error)
+    Create(todo Todo) error
+    Delete(id string) error
+}
+
+// real implementation — hits actual db
+type GORMRepository struct{ db *gorm.DB }
+func (r *GORMRepository) GetAll() ([]Todo, error) { /* real db query */ }
+
+// test implementation — no db needed
+type MockRepository struct{}
+func (r *MockRepository) GetAll() ([]Todo, error) {
+    return []Todo{{Title: "fake todo"}}, nil
+}
+
+// handler accepts the interface — works with gorm or mock
+func TodoHandler(repo TodoRepository) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        todos, err := repo.GetAll()
+        // ...
+    }
+}
+
+// swap implementations without changing the handler
+TodoHandler(&GORMRepository{db: db})   // production
+TodoHandler(&MockRepository{})          // testing
+```
+
+this is dependency injection — the interface is the contract, implementations are swappable.
+
+## what interfaces can and cannot contain
+
+```go
+// interfaces can only contain method signatures
+type Valid interface {
+    Do() error
+    Describe() string
+}
+
+// interfaces can embed other interfaces
+type Extended interface {
+    Valid         // embeds Valid
+    Extra() bool
+}
+
+// interfaces CANNOT contain fields
+type Invalid interface {
+    Name string  // compile error — fields not allowed in interfaces
+    Do() error
+}
+```
+
+## gotchas
+
+```go
+// implicit implementation — you can satisfy someone else's interface
+// without touching their code at all
+// your struct + their interface = automatic satisfaction if methods match
+
+// interface embedding in struct — rare but valid
+type Service struct {
+    Notifier        // embedded interface inside struct
+    Name string
+}
+// methods are promoted — Service now has Send() and Channel()
+// still need to assign a concrete implementation at runtime
+
+// nil interface vs nil pointer — subtle trap
+var e *EmailNotifier = nil  // nil pointer to EmailNotifier
+var n Notifier = e          // n is not nil — it has type info (*EmailNotifier)
+fmt.Println(n == nil)       // false — interface holds type + value, both needed for nil
+// this causes unexpected behavior when returning errors from functions
+// covered in topic 14 — error handling
+```

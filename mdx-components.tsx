@@ -4,8 +4,6 @@ import CopyButton from "./components/CopyButton";
 export function useMDXComponents(components: MDXComponents): MDXComponents {
   return {
     h1: ({ children }) => {
-      console.log("h1 rendered");
-
       return (
         <h1 className="text-3xl font-light tracking-tight text-white mb-2">
           {children}
@@ -41,7 +39,6 @@ export function useMDXComponents(components: MDXComponents): MDXComponents {
       <strong className="text-[#ccc] font-medium">{children}</strong>
     ),
     figure: ({ children, ...props }) => {
-      console.log("figure rendered");
       return <figure {...props}>{children}</figure>;
     },
     ...components,

@@ -1,0 +1,208 @@
+---
+title: maps
+desc: go's key-value store. like js objects but typed, stricter, and with a comma ok pattern you'll use constantly to avoid silent bugs.
+tag: go
+---
+
+maps are go's equivalent of js objects or python dicts — key-value pairs, dynamic, reference type. but they're typed, iteration order is not guaranteed, and accessing a missing key gives you a zero value instead of undefined.
+
+## declaring maps
+
+```go
+// map literal — when you know the data upfront
+statusMessages := map[int]string{
+    200: "ok",
+    201: "created",
+    404: "not found",
+    500: "internal server error", // trailing comma required
+}
+
+// make — when populating dynamically
+hits := make(map[string]int)
+hits["/users"] = 0
+hits["/posts"] = 0
+
+// empty literal — same as make for most purposes
+sessions := map[string]string{}
+sessions["token_abc"] = "user_1"
+```
+
+## zero value — nil map
+
+```go
+var m map[string]int // nil map
+
+fmt.Println(m == nil)  // true
+fmt.Println(m)         // map[] — prints same as empty map
+fmt.Println(m["key"])  // 0 — reading is safe, returns zero value
+
+m["key"] = 1 // panic — writing to nil map crashes
+```
+
+always initialize before writing:
+
+```go
+var m = map[string]int{}  // empty, ready to write
+m := make(map[string]int) // same thing
+```
+
+## the comma ok pattern — safe key lookup
+
+missing key returns zero value silently — no error, no panic. in a backend this means you're returning `""` or `0` to the client without knowing why.
+
+```go
+// unsafe — returns "" if key missing, you'd never know
+msg := statusMessages[500]
+
+// safe — comma ok pattern
+if msg, ok := statusMessages[500]; ok {
+    fmt.Println("found:", msg)
+} else {
+    fmt.Println("key not found")
+}
+```
+
+wrap it in a function for reuse:
+
+```go
+func getStatusMessage(codes map[int]string, code int) string {
+    if msg, ok := codes[code]; ok {
+        return msg
+    }
+    return "unknown status"
+}
+```
+
+## delete and iteration
+
+```go
+sessions := map[string]string{
+    "token_abc": "user_1",
+    "token_xyz": "user_2",
+    "token_123": "user_3",
+}
+
+delete(sessions, "token_xyz") // safe even if key doesn't exist
+
+for k, v := range sessions {
+    fmt.Printf("%s: %s\n", k, v)
+}
+```
+
+iteration order is not guaranteed — every range over a map may give a different order. for deterministic output, collect keys, sort, then iterate:
+
+```go
+import "sort"
+
+keys := []string{}
+for k := range sessions {
+    keys = append(keys, k)
+}
+sort.Strings(keys)
+for _, k := range keys {
+    fmt.Println(k, sessions[k])
+}
+```
+
+## maps are reference types
+
+same trap as slices — assignment copies the pointer, both variables point to the same map.
+
+```go
+original := map[string]int{"requests": 100}
+ref      := original
+ref["requests"] = 999
+
+fmt.Println(original["requests"]) // 999 — mutated
+```
+
+no built-in `copy()` for maps — manually loop:
+
+```go
+copied := make(map[string]int)
+for k, v := range original {
+    copied[k] = v
+}
+copied["requests"] = 1
+fmt.Println(original["requests"]) // 999 — unchanged
+```
+
+## passing maps to functions
+
+maps passed to functions modify the original — no return needed. this is different from slices where append needs a return.
+
+```go
+// no return needed — map is a reference type
+// hits[route]++ modifies the original map directly
+func recordHit(hits map[string]int, route string) {
+    hits[route]++
+    // also works without pre-initializing the key
+    // go uses zero value (0) then increments — hits["/new"]++ just works
+}
+```
+
+## nested maps
+
+```go
+perms := map[string]map[string]string{
+    "alice": {"posts": "write", "comments": "read"},
+    "bob":   {"posts": "read",  "comments": "read"},
+}
+
+// always check outer key exists before accessing inner
+func canWrite(perms map[string]map[string]string, user, resource string) bool {
+    if _, ok := perms[user]; !ok {
+        return false // user doesn't exist — inner map would be nil
+    }
+    return perms[user][resource] == "write"
+}
+```
+
+accessing a missing outer key returns a nil inner map. then accessing that nil inner map returns the zero value — silent bug.
+
+## real world — route hit counter
+
+```go
+routeHits := map[string]int{}
+
+func recordHit(hits map[string]int, route string) {
+    hits[route]++ // works even on first hit — zero value is 0
+}
+
+recordHit(routeHits, "/users")
+recordHit(routeHits, "/users")
+recordHit(routeHits, "/posts")
+
+// find top route
+func topRoute(hits map[string]int) string {
+    top := ""
+    max := 0
+    for route, count := range hits {
+        if count > max {
+            max   = count
+            top   = route
+        }
+    }
+    return top
+}
+```
+
+## gotchas
+
+```go
+// map keys must be comparable types
+// valid: string, int, bool, struct with comparable fields
+// invalid: slice, map, function — compile error as key type
+m := map[[]string]int{} // compile error
+
+// map[] in print output is not an array
+// it's just go's formatting — maps are hash tables, not arrays of objects
+fmt.Println(m) // map[200:ok 404:not found]
+
+// if two keys hash to same value (collision)
+// go handles it internally — you don't manage this
+// but iteration order is still not guaranteed
+
+// concurrent map access is not safe — use sync.RWMutex
+// covered in topic 25
+```

@@ -1,0 +1,213 @@
+---
+title: functions
+desc: functions are first-class in go. multiple returns, variadic args, functions as values, factory pattern. this is the foundation of every middleware pattern you'll write.
+tag: go
+---
+
+functions in go are first-class citizens — assigned to variables, passed as arguments, returned from other functions. you already use this in gin with middleware. now let's understand what's actually happening.
+
+## basic function
+
+```go
+// func name(params) returnType
+func greet(name string) string {
+    return "hello, " + name
+}
+```
+
+## multiple return values — go's answer to try/catch
+
+instead of throwing exceptions, return the result and error together. caller must handle both.
+
+```go
+// convention — error is always the last return value
+func divide(a, b float64) (float64, error) {
+    if b == 0 {
+        return 0, fmt.Errorf("b cannot be zero") // error messages lowercase
+    }
+    return a / b, nil
+}
+
+func parsePort(s string) (int, error) {
+    num, err := strconv.Atoi(s)
+    if err != nil {
+        return 0, fmt.Errorf("invalid port: %s", s)
+    }
+    if num < 1 || num > 65535 {
+        return 0, fmt.Errorf("port out of range: %d", num)
+    }
+    return num, nil
+}
+
+// calling
+result, err := divide(10, 3)
+if err != nil {
+    fmt.Println(err)
+    return
+}
+fmt.Printf("%.2f\n", result)
+```
+
+## named return values
+
+name your return values — they become variables in the function body. use naked `return` to return them.
+
+```go
+func calcPagination(total, pageSize, page int) (offset, limit, pages int) {
+    if pageSize == 0 {
+        return // naked return — offset, limit, pages all zero
+    }
+    offset = pageSize * (page - 1)
+    limit  = pageSize
+    pages  = total / pageSize
+    return  // naked return — returns offset, limit, pages
+}
+```
+
+use for short functions only. in long functions, naked returns make it hard to track what's actually being returned.
+
+## variadic functions
+
+accept any number of arguments — like js rest params `...args`.
+
+```go
+func sum(nums ...int) int {
+    total := 0
+    for _, n := range nums {
+        total += n
+    }
+    return total
+    // sum() with no args returns 0 — safe, nothing to range over
+}
+
+func logMessage(level string, parts ...string) string {
+    return fmt.Sprintf("[%s] %s", level, strings.Join(parts, " "))
+}
+
+sum(1, 2, 3, 4)    // 10
+sum()               // 0
+
+// spread a slice into a variadic function
+nums := []int{1, 2, 3, 4, 5}
+sum(nums...)        // 15 — spread with ...
+// sum(nums) won't compile — []int is not int
+// arrays cannot be spread — only slices
+```
+
+## functions as values
+
+a function type is just like any other type.
+
+```go
+// func(string) string means:
+// "a variable holding a function that takes a string and returns a string"
+
+greet := func(name string) string {
+    return "hello, " + name
+}
+
+result := greet("alice") // "hello, alice"
+```
+
+**reading complex function signatures — break it down left to right:**
+
+```go
+func(string) string
+// takes string, returns string
+
+func(func(string) string) func(string) string
+// takes a (func that takes string returns string)
+// returns a (func that takes string returns string)
+// this is the middleware wrapper signature
+```
+
+## middleware pattern — functions wrapping functions
+
+```go
+func logger(next func(string) string) func(string) string {
+    return func(s string) string {
+        fmt.Println("[LOG] calling handler")
+        result := next(s) // call the original handler
+        fmt.Println("[LOG] handler returned:", result)
+        return result
+    }
+}
+
+func greetHandler(name string) string {
+    return "hello, " + name
+}
+
+wrapped := logger(greetHandler)
+fmt.Println(wrapped("alice"))
+// [LOG] calling handler
+// [LOG] handler returned: hello, alice
+// hello, alice
+```
+
+`logger` takes a handler, returns a new handler that does logging then calls the original. this is exactly how gin middleware works internally.
+
+## factory pattern — functions returning functions
+
+```go
+func makeRateLimiter(maxRequests int) func() bool {
+    requestCount := 0 // this variable lives in the returned function's closure
+    return func() bool {
+        requestCount++
+        return requestCount <= maxRequests // use the param, not a hardcoded number
+    }
+}
+
+limiter := makeRateLimiter(3)
+fmt.Println(limiter()) // true
+fmt.Println(limiter()) // true
+fmt.Println(limiter()) // true
+fmt.Println(limiter()) // false — exceeded
+```
+
+the returned function remembers `requestCount` and `maxRequests` across calls. this is a closure — covered fully in topic 26.
+
+## pipeline — chaining functions
+
+```go
+func pipeline(middlewares ...func(string) string) func(string) string {
+    return func(req string) string {
+        result := req
+        for _, m := range middlewares {
+            result = m(result) // each middleware gets previous output
+        }
+        return result
+    }
+}
+
+func withRequestID(req string) string { return req + " [id:abc123]" }
+func withTimestamp(req string) string { return req + " [ts:1234567890]" }
+func withAuth(req string) string      { return "authenticated: " + req }
+
+process := pipeline(withRequestID, withTimestamp, withAuth)
+fmt.Println(process("GET /users"))
+// authenticated: GET /users [id:abc123] [ts:1234567890]
+```
+
+this is literally how gin's middleware chain works. request flows through each middleware, each one's output becomes the next one's input.
+
+## gotchas
+
+```go
+// wrong format verb = runtime error not compile error
+fmt.Printf("%d", "hello") // prints %!d(string=hello), keeps running
+                           // silent bug in logs
+
+// hardcoding inside factory functions
+func makeRateLimiter(maxRequests int) func() bool {
+    count := 0
+    return func() bool {
+        count++
+        return count <= 3 // wrong — ignores maxRequests param
+        return count <= maxRequests // correct
+    }
+}
+
+// forgetting to reassign after functions that return slices
+middlewares = use(middlewares, "logger") // correct
+use(middlewares, "logger")              // wrong — middlewares unchanged
+```

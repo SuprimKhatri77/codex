@@ -22,16 +22,16 @@ const notes = [
     section: "Go / Gin",
     items: [
       {
-        slug: "/golang/jwt-auth",
+        slug: "/golang",
         tag: "golang",
-        title: "JWT auth in Go",
-        desc: "access + refresh tokens, rotation",
+        title: "Go notes",
+        desc: "basics, control flow, data structures, core",
       },
       {
-        slug: "/golang/repository-pattern",
-        tag: "golang",
-        title: "repository pattern + DI",
-        desc: "closures, interfaces, clean structure",
+        slug: "/gin",
+        tag: "gin",
+        title: "Gin notes",
+        desc: "routing, middleware, handlers, errors",
       },
     ],
   },
@@ -58,9 +58,6 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-[#0d0d0d] text-[#e8e8e8] px-8 py-12 max-w-4xl mx-auto">
       <div className="mb-12">
-        <p className="font-mono text-[11px] text-[#555] tracking-[0.15em] uppercase mb-6">
-          ~/codex
-        </p>
         <h1 className="text-4xl font-light tracking-tight text-[#e8e8e8] mb-2">
           my dev <span className="font-medium text-white">notes</span>
         </h1>

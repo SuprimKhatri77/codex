@@ -1,0 +1,127 @@
+---
+title: data types & variables
+desc: go is statically typed. types are checked at compile time, not runtime. no undefined, no null surprises, no implicit coercion.
+tag: go
+---
+
+go is statically typed — unlike js where everything is `number` or `any` at runtime, go enforces types at compile time. wrong type = won't even compile.
+
+think of it like typescript with the strictness cranked to max, but enforced always, no escape hatches.
+
+## declaring variables
+
+three ways to declare variables in go:
+
+```go
+// 1. explicit — var keyword with type
+var port int = 8080
+var host string = "localhost"
+
+// 2. var block — for grouping related config
+var (
+    host    string = "localhost"
+    port    int    = 8080
+    isHTTPS bool   = false
+)
+
+// 3. short declaration — covered in next topic
+port := 8080
+```
+
+## the types you'll actually use
+
+```go
+var name string   = "alice"       // text
+var port int      = 8080          // whole numbers — default for counts/ids
+var size int64    = 1048576       // use for file sizes, offsets, timestamps
+var ratio float64 = 3.14          // decimals — always prefer float64 over float32
+var isReady bool  = true          // true/false
+```
+
+**why int64 for sizes?** int32 maxes out at ~2GB. file sizes, byte counts, unix timestamps — they grow fast. int64 holds up to 9.2 exabytes. future-proof by default.
+
+## zero values — go's answer to undefined
+
+every variable has a zero value if you don't assign one. no undefined, no null, always predictable.
+
+```go
+var name    string  // ""
+var count   int     // 0
+var ratio   float64 // 0
+var isReady bool    // false
+```
+
+```go
+// js — this is possible and annoying
+let name
+console.log(name) // undefined
+
+// go — always has a value
+var name string
+fmt.Println(name) // ""
+```
+
+## constants
+
+```go
+const MaxRetries int    = 5
+const APIVersion string = "v1"
+const Pi         float64 = 3.14159
+```
+
+constants must be resolvable at **compile time**. only allowed types: `string`, `bool`, `int`, `float`, `rune`.
+
+```go
+// this won't compile — slices are runtime values
+const Routes = []string{"/users", "/posts"}
+
+// use var instead
+var Routes = []string{"/users", "/posts"}
+```
+
+## type conversion — no implicit coercion
+
+go never auto-converts types. you must be explicit.
+
+```go
+var userID int     = 42
+var score  float64 = 9.5
+
+// won't compile — different types
+// total := userID + score
+
+// explicit conversion
+total := float64(userID) + score // 51.5
+```
+
+**gotcha:** `int(9.5)` truncates to `9` — decimal is silently lost. always convert toward float when you need precision.
+
+## gotchas
+
+```go
+// unused variables won't compile — no warnings, just failure
+var name string // if you never use name, compiler refuses to build
+                // unlike eslint which just warns you
+
+// can't redeclare in same scope
+var port int = 8080
+var port int = 9090 // compile error
+
+// constants can't change — ever
+const Max = 5
+Max = 10 // compile error
+```
+
+## hoisting — doesn't exist here
+
+```go
+// js — var gets hoisted (lifted to top of scope)
+console.log(name) // undefined — no error
+var name = "alice"
+
+// go — strict block scope, no hoisting
+fmt.Println(name) // compile error — name not declared yet
+var name = "alice"
+```
+
+variables in go are scoped to the block they're declared in. same as `let`/`const` in js, never `var`.

@@ -3,6 +3,8 @@ import rehypePrettyCode from "rehype-pretty-code";
 import MdxLayout from "@/app/mdx-layout";
 import type { MDXComponents } from "mdx/types";
 import CopyButton from "./CopyButton";
+import rehypeSlug from "rehype-slug";
+import TableOfContents from "./TableOfContents";
 
 const components: MDXComponents = {
   h1: ({ children }) => (
@@ -10,13 +12,18 @@ const components: MDXComponents = {
       {children}
     </h1>
   ),
-  h2: ({ children }) => (
-    <h2 className="font-mono text-[10px] text-[#444] tracking-[0.2em] uppercase mt-12 mb-4 pb-2 border-b border-[#1a1a1a]">
+  h2: ({ children, ...props }) => (
+    <h2
+      className="font-mono text-[10px] text-[#444] tracking-[0.2em] uppercase mt-12 mb-4 pb-2 border-b border-[#1a1a1a]"
+      {...props}
+    >
       {children}
     </h2>
   ),
-  h3: ({ children }) => (
-    <h3 className="text-sm font-medium text-[#ccc] mt-6 mb-2">{children}</h3>
+  h3: ({ children, ...props }) => (
+    <h3 className="text-sm font-medium text-[#ccc] mt-6 mb-2" {...props}>
+      {children}
+    </h3>
   ),
   p: ({ children }) => (
     <p className="text-sm text-[#666] leading-relaxed mb-4 font-mono">
@@ -45,15 +52,29 @@ const components: MDXComponents = {
   ),
 };
 
-export default function MdxContent({ content }: { content: string }) {
+export default function MdxContent({
+  content,
+  frontmatter,
+}: {
+  content: string;
+  frontmatter: { title: string; desc: string };
+}) {
   return (
     <MdxLayout>
+      <TableOfContents content={content} />
+      <h1 className="text-3xl font-light tracking-tight text-slate-50/70 mb-1">
+        {frontmatter.title}
+      </h1>
+      <p className="font-mono text-[13px] text-[#555] mb-12">
+        {frontmatter.desc}
+      </p>
       <MDXRemote
         source={content}
         components={components}
         options={{
           mdxOptions: {
             rehypePlugins: [
+              rehypeSlug,
               [
                 rehypePrettyCode,
                 { theme: "github-dark-dimmed", keepBackground: false },

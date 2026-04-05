@@ -1,0 +1,146 @@
+---
+title: conditions & conditionals
+desc: if/else works like js but no parentheses, braces are mandatory, and there's an init statement that doesn't exist in js at all.
+tag: go
+---
+
+conditions work the same conceptually but go is more explicit about syntax. the init statement is the one new thing worth paying attention to — you'll see it in every real go codebase.
+
+## basic if/else
+
+```go
+token   := "abc123"
+expired := false
+role    := "admin"
+
+if token == "" {
+    fmt.Println("access denied")
+} else if expired {
+    fmt.Println("token expired")
+} else if role == "admin" {
+    fmt.Println("welcome admin")
+} else {
+    fmt.Println("welcome user")
+}
+```
+
+two things different from js:
+
+- no parentheses around the condition — `gofmt` removes them if you add them
+- braces `{}` are mandatory — no single-line ifs without braces
+
+```go
+// won't compile — no braces
+if token == "" fmt.Println("denied")
+
+// won't compile — parentheses alone don't create a scope
+if (token == "") fmt.Println("denied")
+
+// correct way
+if token == "" {
+    fmt.Println("denied")
+}
+```
+
+## init statement — go's unique thing
+
+syntax: `if <init>; <condition> { }`
+
+the init part runs first, declares a variable, and that variable is scoped to the entire if/else block. can't access it outside.
+
+```go
+// without init — u and err live in the rest of the function
+u, err := getUser(id)
+if err != nil {
+    fmt.Println(err)
+}
+// u and err still exist here — risk of accidental reuse
+
+// with init — u and err scoped to this block only
+if u, err := getUser(id); err != nil {
+    fmt.Println(err)
+} else {
+    fmt.Println(u.Name)
+}
+// u and err are gone here — clean scope
+```
+
+use the init statement when you don't need the variables outside the condition. it's the standard pattern for function calls that return a value + error.
+
+the variable is accessible in `else if` and `else` too — not just the first `if` block.
+
+## early return — preferred over nested else
+
+instead of nesting else blocks, return early and let the rest be the happy path.
+
+```go
+// nested — hard to follow
+func getRole(userID int) string {
+    if userID == 1 {
+        return "admin"
+    } else {
+        return "user"
+    }
+}
+
+// early return — cleaner
+func getRole(userID int) string {
+    if userID == 1 {
+        return "admin"
+    }
+    return "user" // only runs if the check above failed
+}
+```
+
+## logical operators
+
+same as js — `&&`, `||`, `!`. no extra parentheses wrapping the whole condition.
+
+```go
+requests     := 85
+isPremium    := false
+isInternalIP := false
+
+if (requests > 100) || (requests > 80 && !isPremium && !isInternalIP) {
+    fmt.Println("rate limited")
+} else {
+    fmt.Println("allowed")
+}
+```
+
+## variable shadowing with init statement
+
+if an outer variable has the same name as the init variable, the inner one shadows it. they're two completely separate variables.
+
+```go
+role := "user" // outer
+
+if role := getRole(1); role == "admin" { // different variable, same name
+    fmt.Println("inner:", role) // "admin"
+}
+
+fmt.Println("outer:", role) // "user" — outer unchanged
+```
+
+some teams use a `shadow` linter to catch this.
+
+## gotchas
+
+```go
+// stray err in wide scope — common bug
+u, err := getUser(7)
+if err != nil { ... }
+
+// later in the same function...
+posts, err := getPosts(7) // err reassigned — you might check the wrong error
+
+// fix — use init statement to scope err tightly
+if u, err := getUser(7); err != nil { ... }
+if posts, err := getPosts(7); err != nil { ... }
+// each err is scoped to its own block
+
+// error messages are lowercase — they get chained
+fmt.Errorf("User not found")   // wrong — looks odd when wrapped
+fmt.Errorf("user not found")   // correct
+// "failed to fetch: user not found" reads naturally
+```

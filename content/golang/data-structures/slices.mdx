@@ -1,0 +1,177 @@
+---
+title: slices
+desc: go's dynamic arrays. reference type, built on top of arrays, three things under the hood. this is what you'll actually use day to day.
+tag: go
+---
+
+slices are go's answer to js arrays — dynamic, flexible, and the thing you'll use 95% of the time instead of arrays. but they behave very differently under the hood.
+
+## what a slice actually is
+
+a slice has three things:
+
+- pointer — where the underlying array starts in memory
+- length — how many elements are currently in the slice
+- capacity — how many the underlying array can hold total
+
+this is why slices behave the way they do — they're a view into an array, not the array itself.
+
+## declaring slices
+
+```go
+// slice literal — like array but no size in brackets
+methods := []string{"GET", "POST", "PUT", "DELETE"}
+
+// make([]type, length, capacity)
+// use when you have a rough idea of the size upfront
+s := make([]string, 0, 5) // length 0, capacity 5
+
+// empty literal, append later
+routes := []string{}
+```
+
+**make gotcha** — `make([]string, 5)` sets both length AND capacity to 5. that means 5 empty `""` slots exist before you append. appending gives you `["" "" "" "" "" "GET" ...]`. use `make([]string, 0, 5)` — length 0, capacity 5.
+
+## zero value — nil vs empty
+
+```go
+var s []string    // nil slice
+e := []string{}  // empty slice
+
+fmt.Println(s == nil) // true
+fmt.Println(e == nil) // false
+fmt.Println(s)        // []
+fmt.Println(e)        // []  — prints the same but internally different
+```
+
+both can be appended to — behave the same for most operations. the difference matters when explicitly checking for nil.
+
+## append and capacity growth
+
+when you append beyond capacity, go allocates a new bigger array, copies all elements over, and discards the old one. capacity roughly doubles for small slices.
+
+```go
+s := make([]int, 0, 2)
+// cap 2
+s = append(s, 1) // len 1, cap 2
+s = append(s, 2) // len 2, cap 2
+s = append(s, 3) // len 3, cap 4 — new array allocated, cap doubled
+s = append(s, 4) // len 4, cap 4
+s = append(s, 5) // len 5, cap 8 — doubled again
+```
+
+**performance implication** — appending 10,000 items one by one = many allocations and copies. if you know the size upfront, pre-allocate:
+
+```go
+// building a response payload — you know the size
+items := make([]TodoResponse, 0, len(dbResults))
+```
+
+always reassign after append — append may create a new underlying array:
+
+```go
+s = append(s, "value") // must reassign
+append(s, "value")     // useless — original s unchanged
+```
+
+## slices are reference types
+
+assignment copies the pointer, not the data. both variables point to the same underlying array.
+
+```go
+// js — same behavior
+const ref = original
+ref[0] = "changed" // original[0] also changed
+
+// go — same behavior
+original := []string{"admin", "user", "guest"}
+ref      := original
+ref[0]    = "superadmin"
+
+fmt.Println(original) // [superadmin user guest] — mutated
+fmt.Println(ref)      // [superadmin user guest]
+```
+
+to make an independent copy, use `copy()`. dst must be pre-allocated — copy doesn't allocate for you. copies `min(len(dst), len(src))` elements.
+
+```go
+copied := make([]string, len(original)) // pre-allocate with same length
+copy(copied, original)                  // copy(destination, source)
+copied[0] = "superadmin"
+
+fmt.Println(original) // [admin user guest] — unchanged
+fmt.Println(copied)   // [superadmin user guest]
+```
+
+## slicing a slice — the head pointer
+
+```go
+requests := []string{"req1", "req2", "req3", "req4", "req5", "req6"}
+// syntax: slice[low:high] — low inclusive, high exclusive
+
+batch1 := requests[0:3] // [req1 req2 req3] — len 3, cap 6
+batch2 := requests[3:]  // [req4 req5 req6] — len 3, cap 3
+middle := requests[1:4] // [req2 req3 req4] — len 3, cap 5
+```
+
+capacity after slicing — the head pointer shifts to where the slice starts. cap = original cap minus the start index. `requests[3:]` starts at index 3, so it can see 3 slots ahead — cap 3.
+
+## passing slices to functions
+
+unlike arrays, size is not part of the slice type. one function works for any size.
+
+```go
+func contains(items []string, target string) bool {
+    for _, v := range items {
+        if v == target {
+            return true
+        }
+    }
+    return false
+}
+
+func filter(nums []int, min int) []int {
+    result := []int{}
+    for _, v := range nums {
+        if v > min {
+            result = append(result, v)
+        }
+    }
+    return result // always return result, even if empty
+                  // don't return original as fallback — caller gets wrong data
+}
+```
+
+## passing slices modifies original
+
+maps and slices passed to functions modify the original — no return needed for mutations. but append still needs a return because it may create a new underlying array.
+
+```go
+// mutation — no return needed
+func recordHit(hits map[string]int, route string) {
+    hits[route]++
+}
+
+// append — must return
+func use(middlewares []string, name string) []string {
+    return append(middlewares, name)
+}
+// caller must reassign
+middlewares = use(middlewares, "logger")
+```
+
+## gotchas
+
+```go
+// copy without pre-allocating — copies 0 elements
+copied := []string{}
+copy(copied, original) // len(dst) is 0 — nothing gets copied
+fmt.Println(copied)    // []
+
+// fix
+copied := make([]string, len(original))
+copy(copied, original) // now copies all elements
+
+// concurrent access to slices is not safe
+// use mutex — covered in topic 25
+```

@@ -1,0 +1,122 @@
+---
+title: console output
+desc: go's fmt package. more explicit than console.log but more powerful. three families — print, sprintf, fprintf — each for a different job.
+tag: go
+---
+
+go uses the `fmt` package for output. no `console.log` — you pick the right tool for the job.
+
+## the three families
+
+```go
+// Print family — writes to stdout
+fmt.Print("hello")          // no newline, no spaces between args
+fmt.Println("hello")        // adds newline + spaces between args automatically
+fmt.Printf("port: %d\n", 8080) // formatted, no auto newline
+
+// Sprintf — returns a formatted string (doesn't print)
+msg := fmt.Sprintf("user %s logged in", "alice")
+
+// Fprintf — writes to any writer (stderr, files, http responses)
+fmt.Fprintf(os.Stderr, "error: %s\n", "db failed")
+fmt.Fprintf(os.Stdout, "server started on port %d\n", 8080)
+```
+
+## print vs println vs printf
+
+```go
+fmt.Print("hello", "world")   // helloworld    — no space, no newline
+fmt.Println("hello", "world") // hello world\n — space + newline
+fmt.Printf("hello world")     // hello world   — no newline, supports verbs
+```
+
+**when to use what:**
+
+- `Println` — everyday logging, quick debug prints
+- `Printf` — structured/formatted output, log lines
+- `Print` — rarely, when you're manually controlling spacing
+- `Sprintf` — building strings before using them elsewhere
+- `Fprintf` — writing to specific streams (stderr, files, http)
+
+## format verbs
+
+```go
+method := "POST"
+path   := "/api/users"
+status := 201
+dur    := 12.45
+auth   := true
+
+fmt.Printf("[REQUEST] %s %s | status: %d | duration: %.2fms | auth: %t\n",
+    method, path, status, dur, auth)
+// [REQUEST] POST /api/users | status: 201 | duration: 12.45ms | auth: true
+```
+
+| verb          | type                    | example                   |
+| ------------- | ----------------------- | ------------------------- |
+| `%s`          | string                  | `"alice"`                 |
+| `%d`          | integer                 | `42`                      |
+| `%f` / `%.2f` | float                   | `3.14`                    |
+| `%t`          | bool                    | `true`                    |
+| `%v`          | any (default)           | `{alice 30}`              |
+| `%+v`         | struct with field names | `{Name:alice Age:30}`     |
+| `%#v`         | go syntax repr          | `main.User{Name:"alice"}` |
+| `%T`          | type of variable        | `main.User`               |
+| `%%`          | literal % sign          | `50%`                     |
+
+## sprintf — build strings, don't print
+
+useful when you need to construct a string for logging, error messages, or returning from a function.
+
+```go
+func formatLog(level, message string) string {
+    return fmt.Sprintf("[%s] %s", level, message)
+}
+
+fmt.Println(formatLog("ERROR", "db connection failed"))
+// [ERROR] db connection failed
+```
+
+## fprintf — write to specific streams
+
+like `console.log` vs `console.error` in js — same terminal, different streams. docker, systemd, log aggregators treat them differently.
+
+```go
+import "os"
+
+fmt.Fprintf(os.Stdout, "server started\n")         // like console.log
+fmt.Fprintf(os.Stderr, "fatal: %s\n", "db failed") // like console.error
+```
+
+## debug verbs for structs
+
+```go
+type User struct {
+    Name  string
+    Email string
+    Age   int
+}
+
+u := User{"alice", "alice@example.com", 30}
+
+fmt.Printf("%v\n", u)   // {alice alice@example.com 30}
+fmt.Printf("%+v\n", u)  // {Name:alice Email:alice@example.com Age:30}
+fmt.Printf("%#v\n", u)  // main.User{Name:"alice", Email:"alice@example.com", Age:30}
+fmt.Printf("%T\n", u)   // main.User
+```
+
+## gotchas
+
+```go
+// wrong verb = runtime formatting error, NOT compile error
+fmt.Printf("%d", "hello") // prints %!d(string=hello) — code keeps running
+                           // silent bug in logs, hard to catch
+
+// literal % must be escaped
+fmt.Printf("success rate: 50%%\n") // prints: success rate: 50%
+fmt.Printf("success rate: 50%\n")  // prints: success rate: 50%!(NOVERB)
+
+// Print doesn't support format verbs
+fmt.Print("%d", 42) // prints: %d42 — not what you want
+fmt.Printf("%d", 42) // prints: 42
+```
