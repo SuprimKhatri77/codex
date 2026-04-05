@@ -1,0 +1,38 @@
+---
+title: merging and rebasing
+desc: combining branches — merge, rebase, cherry-pick
+tag: git
+---
+
+## merging and rebasing
+
+```bash
+git merge feature/my-thing
+```
+
+merges the target branch into the current one. creates a merge commit. fine for most cases, leaves the history a bit messy.
+
+```bash
+git rebase main
+```
+
+replays your commits on top of `main`. keeps history linear. good for keeping feature branches up to date before opening a PR.
+
+```bash
+# typical rebase flow
+git switch feature/my-thing
+git fetch origin
+git rebase origin/main
+```
+
+```bash
+git rebase --abort
+```
+
+bails out of a rebase mid-way if things go sideways. puts you back where you started.
+
+```bash
+git cherry-pick abc1234
+```
+
+applies a single commit from another branch onto your current branch. useful when you just need one specific fix without merging the whole branch.

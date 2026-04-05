@@ -1,0 +1,81 @@
+---
+title: pr merge strategies
+desc: merge commit vs squash vs rebase — what each does and when to use it
+tag: git
+---
+
+## pr merge strategies
+
+three ways to merge a PR. each has a different effect on history.
+
+**merge commit**
+
+```bash
+main: A - B - M
+              |
+feat:   C - D
+```
+
+preserves the branch history. creates an explicit merge commit. good when you want to see that a feature landed as a unit. can get noisy on busy repos.
+
+**squash and merge**
+
+```bash
+main: A - B - CD
+```
+
+squashes all your commits into one and puts it on main. clean history, but you lose the individual commit context. good for small features or when your branch commits are a mess of "wip" and "fix typo".
+
+**rebase and merge**
+
+```bash
+main: A - B - C' - D'
+```
+
+replays each commit from your branch onto main individually. linear history, no merge commit. looks like everything was developed on main. good if your commits are clean and meaningful on their own.
+
+**when to use which:**
+
+- squash if your branch is messy or the whole thing is one logical change
+- rebase if your commits tell a good story and you want them on main individually
+- merge commit if you're on a team that values seeing branch topology in the log
+
+---
+
+## good habits
+
+- **never commit directly to main.** always branch first, even for tiny changes. it keeps things reviewable and easy to revert.
+
+```bash
+# wrong
+git switch main
+# make changes
+git commit -m "quick fix"
+
+# right
+git switch -c fix/whatever
+# make changes
+git commit -m "fix whatever"
+# open a PR
+```
+
+- **pull before you push.** if someone else pushed to the same branch, rebase on top of it before pushing.
+
+```bash
+git pull --rebase
+git push
+```
+
+- **write commits that explain why, not what.** the diff shows what changed. the message should explain the reasoning.
+
+```bash
+# bad
+git commit -m "update styles"
+
+# better
+git commit -m "increase font size on mobile — was unreadable at 12px"
+```
+
+- **stash before switching branches** if you've got uncommitted work in progress. don't just leave it sitting there.
+
+- **check `git status` and `git log --oneline` constantly.** keeps you oriented, prevents surprises.

@@ -1,0 +1,39 @@
+---
+title: status and inspection
+desc: commands to see what's going on before you touch anything
+tag: git
+---
+
+## status and inspection
+
+stuff to run before you do anything — just to see what's going on.
+
+```bash
+git status
+```
+
+shows what's staged, what's modified, what's untracked. run this constantly.
+
+```bash
+git log --oneline
+```
+
+compact history. one commit per line. much less noisy than plain `git log`.
+
+```bash
+git log --oneline --graph
+```
+
+same but draws the branch tree. useful when you're trying to understand how branches relate.
+
+```bash
+git diff
+```
+
+shows unstaged changes. if you've already staged something, use `git diff --staged` to see what's actually going in.
+
+```bash
+git show abc1234
+```
+
+shows what a specific commit changed. swap `abc1234` for any commit hash from `git log --oneline`.

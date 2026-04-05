@@ -1,0 +1,37 @@
+---
+title: undoing things
+desc: reset, restore, revert — how to get out of a mess
+tag: git
+---
+
+## undoing things
+
+```bash
+git reset --hard HEAD~1
+```
+
+nukes the last commit and all its changes. gone. use with caution.
+
+```bash
+git reset --soft HEAD~1
+```
+
+removes the last commit but keeps the changes staged. useful if you committed too early and want to rework things.
+
+```bash
+git restore src/some-file.ts
+```
+
+discards unstaged changes to a file. brings it back to what it was at HEAD. can't undo this so be sure.
+
+```bash
+git restore --staged src/some-file.ts
+```
+
+unstages a file without throwing away your changes. it's just removed from the upcoming commit.
+
+```bash
+git revert abc1234
+```
+
+creates a _new_ commit that undoes a previous one. this is the safe option if the commit has already been pushed to a shared branch — it doesn't rewrite history.
