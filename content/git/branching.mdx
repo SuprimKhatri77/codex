@@ -1,0 +1,59 @@
+---
+title: branching
+desc: creating, switching, and deleting branches
+tag: git
+---
+
+## branching
+
+```bash
+git checkout -b feature/my-thing
+```
+
+creates a new branch and switches to it in one step. the classic.
+
+```bash
+git branch
+```
+
+lists all local branches. `git branch -a` includes remotes too.
+
+```bash
+git branch -d feature/my-thing
+```
+
+deletes a branch. use `-D` if git complains that it's not fully merged and you're sure you want it gone.
+
+```bash
+git switch feature/my-thing
+```
+
+newer way to switch branches. `git switch -c feature/my-thing` creates and switches, same as `checkout -b`. either works, `switch` is just cleaner.
+
+## the golden rule
+
+never commit directly to main. always branch first, do your work, then PR.
+
+```bash
+# wrong — don't do this
+git checkout main
+git add .
+git commit -m "my feature"
+
+# right
+git checkout -b feat/my-thing
+git add .
+git commit -m "my feature"
+git push origin feat/my-thing
+# then open PR
+```
+
+if you accidentally commit to main locally, branch off before pushing:
+
+```bash
+git checkout -b feat/my-thing  # branch from current state
+git checkout main
+git reset --hard origin/main   # reset main back to remote
+```
+
+your commits are now safely on the feature branch, main is clean.

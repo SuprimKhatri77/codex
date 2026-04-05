@@ -52,6 +52,17 @@ const notes = [
       },
     ],
   },
+  {
+    section: "Git",
+    items: [
+      {
+        slug: "/git",
+        tag: "git",
+        title: "Git commands",
+        desc: "branching, remotes, undoing things, pr strategies",
+      },
+    ],
+  },
 ];
 
 export default function Home() {
@@ -72,7 +83,13 @@ export default function Home() {
             <p className="font-mono text-[10px] text-[#444] tracking-[0.2em] uppercase mb-3 pb-2 border-b border-[#1a1a1a]">
               {group.section}
             </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-px bg-[#1a1a1a] border border-[#1a1a1a] rounded-lg overflow-hidden">
+            <div
+              className={`grid gap-px bg-[#1a1a1a] border border-[#1a1a1a] rounded-lg overflow-hidden ${
+                group.items.length === 1
+                  ? "grid-cols-1"
+                  : "grid-cols-1 sm:grid-cols-2"
+              }`}
+            >
               {group.items.map((item) => (
                 <Link
                   key={item.slug}

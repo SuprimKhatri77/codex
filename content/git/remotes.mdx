@@ -1,0 +1,49 @@
+---
+title: remotes
+desc: pushing, pulling, and working with remote repos
+tag: git
+---
+
+## remotes
+
+```bash
+git remote -v
+```
+
+shows what remotes are configured and their urls. good for sanity checking.
+
+```bash
+git remote add origin https://github.com/you/repo.git
+```
+
+connects a local repo to a remote. you'd do this after `git init` on a fresh project.
+
+```bash
+git fetch
+```
+
+downloads changes from remote but doesn't apply them. safe — nothing in your working tree changes.
+
+```bash
+git pull --rebase
+```
+
+fetches and rebases your local commits on top. cleaner than a regular `git pull` which creates a merge commit for no real reason.
+
+```bash
+git push
+```
+
+pushes your current branch to remote. first time on a new branch you'll need:
+
+```bash
+git push -u origin feature/my-thing
+```
+
+the `-u` sets upstream tracking so future `git push` and `git pull` just work.
+
+```bash
+git push -f
+```
+
+force push. rewrites the remote branch. **only do this on your own feature branches**, never on shared branches. if you've rebased or amended commits that were already pushed, you'll need this.

@@ -1,0 +1,43 @@
+---
+title: staging and commits
+desc: how to stage changes and write commits that actually make sense
+tag: git
+---
+
+## staging and commits
+
+```bash
+git add .
+```
+
+stages everything in the current directory. convenient but be careful — use `git status` first so you don't accidentally add junk.
+
+```bash
+git add -p
+```
+
+interactive staging. goes through each diff hunk and asks if you want to stage it. good when you've changed a bunch of stuff and want clean, focused commits instead of one giant blob.
+
+```bash
+git commit -m "your message here"
+```
+
+basic commit. write messages that describe _why_, not just _what_.
+
+```bash
+git commit --amend
+```
+
+rewrites the last commit. use it to fix a typo in your message or add a file you forgot. **don't amend after you've pushed** unless you're okay with force-pushing.
+
+```bash
+git stash
+```
+
+shelves your current changes so you can switch context. nothing gets committed, just saved off to the side.
+
+```bash
+git stash pop
+```
+
+brings those changes back. if you have multiple stashes, `git stash list` shows them and `git stash pop stash@{1}` lets you pick one.
