@@ -1,0 +1,172 @@
+---
+title: gin boilerplate walkthrough
+desc: reading through a production gin setup — what each piece does and why
+tag: gin
+---
+
+## gin.New() vs gin.Default()
+
+```go
+// gin.Default() is just shorthand for:
+r := gin.New()
+r.Use(gin.Logger())
+r.Use(gin.Recovery())
+```
+
+`gin.Default()` silently adds logger and recovery. boilerplate uses `gin.New()` explicitly because it wants a **custom** recovery middleware — one that returns JSON instead of gin's default plain text panic response.
+
+if your API returns JSON everywhere but panics return HTML, that's inconsistent. custom recovery fixes that.
+
+## custom recovery middleware
+
+```go
+func Recovery() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        defer func() {
+            if err := recover(); err != nil {
+                log.Printf("panic recovered: %v", err)
+                c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+                c.Abort()
+            }
+        }()
+        c.Next()
+    }
+}
+```
+
+`recover()` is a built-in Go function that catches panics — like `try/catch` in JS but Go's version:
+
+```go
+// js
+try { } catch(err) { }
+
+// go
+defer func() { recover() }()
+```
+
+`recover()` only works inside a deferred function — Go rule, not optional.
+
+`c.Abort()` stops the middleware chain for that request. doesn't exit the program, just stops that request from proceeding further. `return` after `Abort()` exits the current function too — without it, code keeps running inside the same function even though the chain is stopped.
+
+## gin.HandlerFunc — the type
+
+```go
+type HandlerFunc func(*Context)
+```
+
+this is a **function type** — Go lets you create named types from anything, not just structs:
+
+```go
+type HandlerFunc func(*Context)  // function type
+type UserID      int             // int type
+type Name        string          // string type
+```
+
+any function matching `func(*gin.Context)` automatically satisfies `gin.HandlerFunc`. no explicit declaration needed, same as interfaces.
+
+## closure-based dependency injection
+
+gin internally calls your handler like this:
+
+```go
+handler(c) // only passes *gin.Context, nothing else
+```
+
+gin doesn't know about your db pool, config, or anything else. it only knows `gin.HandlerFunc`. so you can't do this:
+
+```go
+// won't work — wrong signature
+func GetUsers(c *gin.Context, pool *pgxpool.Pool) {
+    pool.Query(...)
+}
+
+r.GET("/users", GetUsers) // gin can't pass pool here
+```
+
+the fix — factory function that closes over dependencies:
+
+```go
+// factory returns gin.HandlerFunc with pool baked in
+func GetUsers(pool *pgxpool.Pool) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        pool.Query(...) // pool available via closure
+    }
+}
+
+r.GET("/users", GetUsers(pool))
+```
+
+gin calls `func(c *gin.Context)` — has no idea pool exists. pool is secretly captured in the closure. same pattern as your todo API — you just didn't know the name for it: **closure-based dependency injection**.
+
+same applies to middleware:
+
+```go
+func RateLimit(maxRequests int) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        // maxRequests available via closure
+    }
+}
+
+r.Use(RateLimit(100))
+```
+
+## explicit http.Server vs r.Run()
+
+```go
+// simple way — you've done this before
+r.Run(":8080")
+
+// explicit way — boilerplate does this
+srv := &http.Server{
+    Addr:    ":8080",
+    Handler: r,
+}
+go func() {
+    srv.ListenAndServe()
+}()
+```
+
+`r.Run()` internally creates an `http.Server` and calls `ListenAndServe` — same thing. explicit server gives you a handle to call `srv.Shutdown()` for graceful shutdown. `r.Run()` doesn't give you that.
+
+## goroutine + graceful shutdown
+
+```go
+// server runs in a goroutine so it doesn't block main
+go func() {
+    log.Printf("server listening on %s", srv.Addr)
+    if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+        log.Fatalf("listen: %v", err)
+    }
+}()
+
+// block here waiting for Ctrl+C or kill signal
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+<-quit
+
+// signal received — shutdown gracefully
+srv.Shutdown(context.Background())
+```
+
+`go func(){}()` — IIFE in JS but runs in a goroutine (separate thread). the `()` at the end invokes it immediately, `go` runs it concurrently so main doesn't block.
+
+`<-quit` — like `await` but for channels. blocks execution until a value arrives. when you Ctrl+C, OS sends `SIGINT`, `signal.Notify` puts it in the `quit` channel, `<-quit` unblocks, shutdown runs.
+
+without the goroutine — `ListenAndServe` blocks forever, `<-quit` never runs, graceful shutdown never happens.
+
+without graceful shutdown — Ctrl+C kills the server mid-request, potentially corrupting data or leaving db connections open. `srv.Shutdown()` waits for in-flight requests to finish first.
+
+## context.Background()
+
+```go
+ctx := context.Background()
+db, err := database.New(ctx, cfg.DatabaseURL)
+```
+
+`context.Background()` is the root context — no timeout, no cancellation, no deadline. think of it as the base context you pass when you don't have a parent context yet.
+
+`pgxpool.New` requires one because it uses it internally to manage the initial connection. if you passed a `context.WithTimeout` here and it expired during startup, the pool would cancel before connecting.
+
+`Background()` = "no deadline, just connect".
+
+you use derived contexts (`WithTimeout`, `WithCancel`) for individual requests — not for startup code.
