@@ -1,0 +1,150 @@
+---
+title: arithmetic operators
+desc: mostly the same as js but go is strict about types. integer division truncates, no implicit coercion, and ++ is a statement not an expression.
+tag: go
+---
+
+operators work like js on the surface but go's type strictness changes how you actually use them day to day.
+
+## basic operators
+
+```go
+a := 7
+b := 2
+
+fmt.Println(a + b)  // 9
+fmt.Println(a - b)  // 5
+fmt.Println(a * b)  // 14
+fmt.Println(a % b)  // 1 — remainder
+fmt.Println(a / b)  // 3 — NOT 3.5, see below
+```
+
+## integer division truncates
+
+this is the one that catches everyone coming from js.
+
+```go
+// js — all numbers are floats under the hood
+7 / 2 // 3.5
+
+// go — integer division truncates the decimal
+a := 7
+b := 2
+fmt.Println(a / b)                   // 3 — truncated, not rounded
+fmt.Println(float64(a) / float64(b)) // 3.5 — explicit conversion needed
+```
+
+in a backend this silently breaks things — prices, percentages, averages. always convert to float64 before dividing when you need decimals.
+
+## cannot mix types
+
+```go
+var userID int     = 42
+var score  float64 = 9.5
+
+// won't compile
+total := userID + score
+
+// convert toward float64 to preserve decimals
+total := float64(userID) + score // 51.5
+
+// int(9.5) truncates — decimal is silently lost
+fmt.Println(int(score)) // 9
+```
+
+## increment and decrement
+
+go has `++` and `--` but they're **statements**, not expressions. must be on their own line, can't use them inside another expression.
+
+```go
+count := 0
+count++ // own line — valid
+count-- // own line — valid
+
+// compile error — can't use ++ in an expression
+total := count++
+
+// no prefix form either — only postfix
+// ++count
+// count++
+```
+
+## division by zero — behavior differs by type
+
+```go
+// int / 0 — panics at runtime
+a := 5
+fmt.Println(a / 0) // panic: integer divide by zero
+
+// float64 / 0 — returns +Inf, no panic
+f := 5.0
+fmt.Println(f / 0) // +Inf
+```
+
+always guard dynamic denominators:
+
+```go
+if divisor == 0 {
+    return 0, fmt.Errorf("cannot divide by zero")
+}
+```
+
+## operator precedence
+
+`* / %` are evaluated before `+ -`. within the same level, left to right.
+
+```go
+result := 2 + 3*4 - 10/2
+// 3*4=12, 10/2=5, then 2+12-5 = 9
+fmt.Println(result) // 9
+```
+
+use parentheses to make intent explicit — don't rely on precedence in complex expressions:
+
+```go
+// hard to read at a glance
+halfExpiry := tokenExpiry/2 + bufferTime*2
+
+// clear
+halfExpiry := (tokenExpiry / 2) + (bufferTime * 2)
+```
+
+## ceiling division — common backend pattern
+
+go has no built-in ceil for integers. standard trick:
+
+```go
+totalItems := 57
+pageSize   := 10
+
+// (a + b - 1) / b gives ceiling without floats
+totalPages := (totalItems + pageSize - 1) / pageSize // 6
+
+// why it works:
+// 57 + 10 - 1 = 66
+// 66 / 10 = 6 (truncated) — correct ceiling
+```
+
+useful for pagination, chunking, rate limit windows.
+
+## gotchas
+
+```go
+// expr+1 is temporary — doesn't mutate the variable
+fmt.Printf("%d", requestCount+1) // requestCount unchanged
+
+// requestCount++ actually mutates
+requestCount++ // requestCount is now requestCount+1
+
+// these are NOT the same thing
+
+// no ternary operator in go
+// result := condition ? a : b
+// use if/else
+var result int
+if condition {
+    result = a
+} else {
+    result = b
+}
+```

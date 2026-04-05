@@ -1,0 +1,143 @@
+---
+title: arrays
+desc: fixed size, value type, rarely used directly in real go code. understand them because slices are built on top of them.
+tag: go
+---
+
+arrays in go are fixed size — the size is part of the type itself. `[3]int` and `[4]int` are completely different types, not interchangeable. in real go code you'll use slices almost always, but arrays are the foundation slices are built on.
+
+## declaring arrays
+
+```go
+// explicit size with values
+arr1 := [5]int{200, 201, 400, 404, 500}
+
+// let go count the size
+arr2 := [...]int{200, 201, 400, 404, 500} // size inferred as 5
+
+// declare with zero values, assign individually
+var arr3 [5]int
+arr3[0] = 200
+arr3[1] = 201
+// arr3 is now [200 201 0 0 0]
+```
+
+zero values depend on element type — `int` to `0`, `string` to `""`, `bool` to `false`.
+
+## size is part of the type
+
+```go
+a := [3]int{1, 2, 3}
+b := [4]int{1, 2, 3, 4}
+
+fmt.Println(a == b) // compile error — mismatched types
+```
+
+this is why functions that take arrays only work for one specific size. real go code uses slices instead — slice functions work for any size.
+
+```go
+// only works for exactly [4]string
+func contains(routes [4]string, target string) bool { ... }
+
+// works for any size
+func contains(routes []string, target string) bool { ... }
+```
+
+## out of bounds — two kinds of errors
+
+```go
+arr := [5]int{1, 2, 3, 4, 5}
+
+// compile time error — compiler knows the index is too large
+arr[5] = 99 // index 5 out of bounds [5]
+
+// runtime panic — dynamic index, compiler can't check
+i := 5
+arr[i] = 99 // compiles fine, panics when it runs
+```
+
+compile time = caught before the program runs. runtime = program crashes in production. always guard dynamic indices:
+
+```go
+if i < len(arr) {
+    arr[i] = val
+}
+```
+
+## arrays are value types — not references
+
+```go
+// js — same reference, mutating copy mutates original
+const copy = original
+copy[0] = "changed" // original[0] is now "changed" too
+
+// go — full copy, independent
+original := [3]string{"admin", "user", "guest"}
+copied   := original
+copied[0] = "superadmin"
+
+fmt.Println(original) // [admin user guest] — unchanged
+fmt.Println(copied)   // [superadmin user guest]
+```
+
+arrays live on the stack — fixed size, short-lived. slices and maps live on the heap.
+
+## iterating
+
+```go
+routes := [4]string{"/health", "/users", "/posts", "/auth"}
+
+// classic for
+for i := 0; i < len(routes); i++ {
+    fmt.Println(routes[i])
+}
+
+// range — cleaner
+for i, v := range routes {
+    fmt.Printf("%d: %s\n", i, v)
+}
+```
+
+## 2d arrays
+
+```go
+roles       := [3]string{"admin", "moderator", "guest"}
+permissions := [3]string{"read", "write", "delete"}
+
+mat := [3][3]bool{
+    {true, true, true},   // admin
+    {true, true, false},  // moderator
+    {true, false, false}, // guest — trailing comma required
+}
+
+for i := 0; i < len(mat); i++ {
+    fmt.Printf("%s: ", roles[i])
+    for j := 0; j < len(mat[i]); j++ {
+        fmt.Printf("%s=%t ", permissions[j], mat[i][j])
+        // use permissions[j] not [i] — j changes per column not row
+    }
+    fmt.Println()
+}
+```
+
+## gotchas
+
+```go
+// trailing comma required when closing brace is on its own line
+mat := [3][3]bool{
+    {true, true, true},
+    {true, true, false},
+    {true, false, false}, // remove this comma — compile error
+}
+
+// don't shadow built-in functions with variable names
+copy := original // copy is a built-in in go — valid but shadows it
+copied := original // use a different name
+
+// runtime panics are silent until they happen
+i := 10
+arr[i] = 99 // compiles fine, crashes in production
+// guard: if i < len(arr) { arr[i] = val }
+```
+
+when to actually use arrays — when size is a hard constraint defined by the problem. rgb `[3]int`, crypto keys where size is protocol-defined. anything where the size is a decision that can change → use a slice.

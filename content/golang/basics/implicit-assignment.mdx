@@ -1,0 +1,135 @@
+---
+title: short variable declaration
+desc: the := operator. you'll use this 90% of the time inside functions. faster to write, type is inferred, but has rules that'll trip you up.
+tag: go
+---
+
+`:=` is go's shorthand for declaring and initializing a variable in one step. no `var`, no explicit type — go infers it from the value.
+
+```go
+host    := "localhost" // string
+port    := 8080        // int
+isReady := true        // bool
+ratio   := 9.0         // float64
+```
+
+you'll use this constantly inside functions. `var` is for package-level declarations and zero-value declarations.
+
+## where := is illegal
+
+`:=` is a **statement** — statements only live inside function bodies. package level only allows declarations (`var`, `const`, `func`, `type`).
+
+```go
+// compile error — := not allowed outside functions
+host := "localhost"
+
+func main() {
+    fmt.Println(host)
+}
+
+// use var at package level
+var host = "localhost"
+
+func main() {
+    fmt.Println(host)
+}
+```
+
+## type inference — what go assumes
+
+```go
+score := 9    // int — not int32, not int64. just int (64-bit on modern systems)
+gpa   := 9.0  // float64 — default for any decimal literal
+name  := "go" // string
+```
+
+```go
+// still can't mix types even with := inference
+total := score + gpa // compile error — int + float64
+
+// explicit conversion
+total := float64(score) + gpa
+```
+
+## the redeclaration rule — the quirk
+
+in the same scope, `:=` won't let you redeclare an existing variable **unless at least one variable on the left is brand new**.
+
+```go
+// both new — fine
+userID, err := 101, error(nil)
+
+// username is new — err just gets reassigned
+username, err := "alice", nil
+
+// nothing new on the left — compile error
+userID, err := 999, nil
+```
+
+existing variables on the left aren't redeclared — they're **reassigned**. same variable, same memory address, new value.
+
+this pattern is used everywhere with `err`:
+
+```go
+rows, err := db.Query(...)       // err declared here
+user, err := parseRow(rows...)   // err reassigned — not a new variable
+```
+
+## scope trap
+
+`:=` respects block scope strictly. no hoisting, no leaking.
+
+```go
+status := "inactive"
+
+if status == "inactive" {
+    updatedStatus := "active"           // scoped to this block only
+    fmt.Println("inside:", updatedStatus)
+}
+
+fmt.Println(updatedStatus) // compile error — not in scope
+```
+
+fix — declare outside the block first:
+
+```go
+var updatedStatus string // zero value: ""
+if status == "inactive" {
+    updatedStatus = "active" // assignment, not declaration
+}
+fmt.Println(updatedStatus)
+```
+
+## when to use what
+
+```go
+// := inside functions, when you have a value ready (most common)
+port := 8080
+
+// var inside functions, when you need a zero value first
+var updatedStatus string
+if condition {
+    updatedStatus = "active"
+}
+
+// var at package level — no := allowed there
+var defaultHost = "localhost"
+
+// const for values that never change
+const MaxRetries = 5
+```
+
+## gotchas
+
+```go
+// shadow warning — outer and inner are different variables
+role := "user"
+if role := getRole(1); role == "admin" { // different variable, same name
+    fmt.Println(role) // "admin" — inner
+}
+fmt.Println(role) // "user" — outer unchanged
+
+// := must initialize — can't just declare
+// var name string  zero value
+// name :=          syntax error — needs a value
+```

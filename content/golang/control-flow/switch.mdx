@@ -1,0 +1,153 @@
+---
+title: switch
+desc: go's switch is cleaner than js. no break needed, multiple values per case, and the expressionless form is a better if/else chain replacement.
+tag: go
+---
+
+go's switch is meaningfully different from js. the defaults are flipped — in js fallthrough is the default, in go break is the default. and the expressionless form is something js doesn't have at all.
+
+## basic switch — no break needed
+
+```go
+statusCode := 404
+
+switch statusCode {
+case 200:
+    fmt.Println("ok")
+case 201:
+    fmt.Println("created")
+case 404:
+    fmt.Println("not found") // only this runs — auto break
+case 500:
+    fmt.Println("internal server error")
+default:
+    fmt.Println("unknown status") // runs if nothing matches
+}
+```
+
+`default` runs when no case matches — like the final `else` in an if/else chain.
+
+## multiple values per case
+
+```go
+// js — relies on fallthrough (no break between cases)
+switch (code) {
+    case 200:
+    case 201:
+    case 204:
+        console.log("success")
+        break
+}
+
+// go — comma separated, one line
+switch statusCode {
+case 200, 201, 204:
+    fmt.Println("success")
+case 400, 401, 403, 404:
+    fmt.Println("client error")
+case 500, 502, 503:
+    fmt.Println("server error")
+default:
+    fmt.Println("unknown")
+}
+```
+
+## expressionless (naked) switch
+
+no variable after `switch` — each case is a full boolean condition. go enters the block and evaluates cases top to bottom, stops at first match.
+
+this is a cleaner replacement for long if/else chains.
+
+```go
+requests := 75
+
+switch {
+case requests > 100:
+    fmt.Println("critical: rate limit exceeded")
+case requests > 80:
+    fmt.Println("warning: approaching limit")
+case requests > 50:
+    fmt.Println("moderate traffic") // this runs for 75
+default:
+    fmt.Println("normal traffic")
+}
+```
+
+does not evaluate all cases — stops at first true condition.
+
+## init statement
+
+same as if — declare a variable before the condition. scoped to the entire switch block.
+
+```go
+// with init — role scoped to switch only
+switch role := getUserRole(userID); role {
+case "admin":
+    fmt.Println("welcome admin —", role)
+case "moderator":
+    fmt.Println("welcome mod —", role)
+default:
+    fmt.Println("welcome guest —", role)
+}
+// role doesn't exist here
+
+// without init — role accessible but anonymous, can't reference in cases
+switch getUserRole(userID) {
+case "admin":
+    // can't use the value here — no name for it
+}
+```
+
+use init statement when you need to reference the result inside cases.
+
+## fallthrough
+
+explicit opt-in to run the next case's body. opposite default from js.
+
+```go
+version := 1
+
+switch version {
+case 1:
+    fmt.Println("v1 handler")
+    fallthrough // blindly runs case 2 body — no condition check
+case 2:
+    fmt.Println("v2 handler")
+    // no fallthrough — stops here
+case 3:
+    fmt.Println("v3 handler")
+}
+// output:
+// v1 handler
+// v2 handler
+```
+
+`fallthrough` is blind — it doesn't check the next case's condition, it just executes the body. falls through one level only unless that case also has `fallthrough`.
+
+## gotchas
+
+```go
+// fallthrough in default — compile error
+switch x {
+case 1:
+    fmt.Println("one")
+default:
+    fallthrough // "cannot fallthrough final case in switch"
+}
+
+// js default — fallthrough (need break to stop)
+// go default — break    (need fallthrough to continue)
+// opposite defaults — worth burning into memory
+
+// switch fn() vs switch val := fn(); val
+switch getUserRole(id) {
+case "admin": // can match but can't use the value inside
+}
+
+switch role := getUserRole(id); role {
+case "admin":
+    sendAdminEmail(role) // can use role here
+}
+```
+
+use expressionless switch instead of long if/else chains — it reads cleaner and scales better as you add conditions.
