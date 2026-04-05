@@ -31,7 +31,7 @@ const notes = [
         slug: "/gin",
         tag: "gin",
         title: "Gin notes",
-        desc: "routing, middleware, handlers, errors",
+        desc: "boilerplate, middleware, routing, request binding",
       },
     ],
   },
