@@ -1,3 +1,5 @@
+import Search from "@/components/Search";
+import { getAllNotes } from "@/lib/mdx";
 import Link from "next/link";
 
 const notes = [
@@ -55,18 +57,23 @@ const notes = [
 ];
 
 export default function Home() {
+  const allNotes = getAllNotes();
+
   return (
     <main className="min-h-screen bg-[#0d0d0d] text-[#e8e8e8] px-8 py-12 max-w-4xl mx-auto">
-      <div className="mb-12">
-        <p className="font-mono text-[11px] text-[#555] tracking-[0.15em] uppercase mb-6">
-          ~/codex
-        </p>
-        <h1 className="text-4xl font-light tracking-tight text-[#e8e8e8] mb-2">
-          my dev <span className="font-medium text-white">notes</span>
-        </h1>
-        <p className="font-mono text-[13px] text-[#555]">
-          {"//"} things i figured out, written down
-        </p>
+      <div className="flex items-center justify-between mb-12">
+        <div>
+          <p className="font-mono text-[11px] text-[#555] tracking-[0.15em] uppercase mb-6">
+            ~/codex
+          </p>
+          <h1 className="text-4xl font-light tracking-tight text-[#e8e8e8] mb-2">
+            my dev <span className="font-medium text-white">notes</span>
+          </h1>
+          <p className="font-mono text-[13px] text-[#555]">
+            {"//"} things i figured out, written down
+          </p>
+        </div>
+        <Search notes={allNotes} />
       </div>
 
       <div className="space-y-10">

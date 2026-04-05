@@ -44,7 +44,7 @@ what each flag does:
 
 ## database url
 
-```env
+```bash
 DATABASE_URL="postgres://youruser:yourpass@localhost:5432/yourdb?sslmode=disable"
 ```
 
@@ -70,7 +70,7 @@ make migrate-down  # rolls back one step
 
 golang-migrate runs all `.up.sql` files in order based on the number prefix:
 
-```
+```bash
 0001_create_users.up.sql     ← runs first
 0002_create_todos.up.sql     ← runs second
 0003_create_orders.up.sql    ← runs third
