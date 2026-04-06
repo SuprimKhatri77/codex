@@ -1,0 +1,266 @@
+---
+title: error handling
+desc: errors are values in go. no try/catch, no throwing. return them, check them, wrap them. explicit and impossible to accidentally ignore.
+tag: go
+---
+
+in go, errors are just values you return and check. no exceptions, no stack unwinding, no try/catch. if a function can fail, it returns an error as the last value.
+
+```go
+// js
+try {
+    const user = await getUser(id)
+} catch (err) {
+    console.error(err)
+}
+
+// go — explicit, no magic
+user, err := getUser(id)
+if err != nil {
+    fmt.Println(err)
+    return
+}
+```
+
+## the error interface
+
+the built-in `error` type is literally just an interface with one method:
+
+```go
+type error interface {
+    Error() string
+}
+```
+
+any type that has `Error() string` satisfies it — implicit implementation, same as any other interface in go.
+
+## returning and handling errors
+
+```go
+// error is always the last return value
+func readConfig(path string) (string, error) {
+    if path == "" {
+        return "", fmt.Errorf("path is empty") // lowercase — see gotchas
+    }
+    if !strings.HasSuffix(path, ".yaml") {
+        return "", fmt.Errorf("invalid extension, expected .yaml got %s", path)
+    }
+    return "config data", nil
+}
+
+config, err := readConfig("config.yaml")
+if err != nil {
+    fmt.Println(err)
+    return
+}
+fmt.Println(config)
+```
+
+## custom error types
+
+when you need structured errors — http status codes, error codes, machine-readable context:
+
+```go
+type AppError struct {
+    Code       int
+    Message    string
+    StatusCode int
+}
+
+// implement Error() string — this is what satisfies the error interface
+// use pointer receiver — *AppError is what satisfies error, not AppError
+func (ae *AppError) Error() string {
+    return fmt.Sprintf("[%d] %s (http %d)", ae.Code, ae.Message, ae.StatusCode)
+}
+
+func getUser(id int) (*User, error) {
+    switch {
+    case id == 1 || id == 2:
+        return &User{ID: id}, nil
+    case id <= 0:
+        return nil, &AppError{Code: 400, Message: "invalid id", StatusCode: 400}
+    default:
+        return nil, &AppError{Code: 404, Message: "user not found", StatusCode: 404}
+    }
+}
+```
+
+## error wrapping with %w
+
+errors travel through layers — db, repository, service, handler. each layer adds context without losing the original.
+
+```go
+func dbQuery(id int) error {
+    if id > 100 {
+        return fmt.Errorf("record not found for id %d", id)
+    }
+    return nil
+}
+
+func repository(id int) error {
+    err := dbQuery(id)
+    if err == nil { return nil } // guard — never wrap nil (%w on nil = %!w(<nil>))
+    return fmt.Errorf("repository.GetUser: %w", err)
+}
+
+func service(id int) error {
+    err := repository(id)
+    if err == nil { return nil }
+    return fmt.Errorf("service.GetUser: %w", err)
+}
+
+err := service(150)
+fmt.Println(err)
+// service.GetUser: repository.GetUser: record not found for id 150
+```
+
+**%w vs %v — the difference that matters:**
+
+```go
+original := errors.New("database timeout")
+
+withW := fmt.Errorf("service: %w", original) // wraps — chain preserved
+withV := fmt.Errorf("service: %v", original) // string only — chain broken
+
+// both print: "service: database timeout"
+// but only %w keeps the original accessible
+
+errors.Is(withW, original) // true  — walks chain, finds original
+errors.Is(withV, original) // false — original is gone, just a string now
+errors.Unwrap(withW)       // returns original
+errors.Unwrap(withV)       // returns nil — nothing to unwrap
+```
+
+use `%w` when callers need to inspect what's inside. use `%v` when you just want the message as a string.
+
+## sentinel errors
+
+predefined error values at package level. check with `errors.Is` — never compare error strings directly.
+
+```go
+var ErrUnauthorized  = errors.New("unauthorized")
+var ErrExpired       = errors.New("token expired")
+var ErrInvalidUserID = errors.New("invalid user id")
+
+func authenticate(token string) error {
+    switch token {
+    case "valid-token":   return nil
+    case "expired-token": return ErrExpired
+    case "":              return ErrUnauthorized
+    default:              return fmt.Errorf("authenticate: %w", ErrUnauthorized)
+    }
+}
+
+err := authenticate("expired-token")
+if errors.Is(err, ErrExpired) {
+    fmt.Println("token expired — ask user to re-login")
+}
+```
+
+`errors.Is` walks the entire error chain — works even when the sentinel is wrapped with `%w`.
+
+## errors.As — extract typed error from chain
+
+`errors.Is` checks for a specific value. `errors.As` checks for a specific type and extracts it.
+
+```go
+var appErr *AppError               // nil right now — no AppError in memory yet
+
+_, err := getUser(5)               // getUser returns &AppError{StatusCode: 404}
+wrapped := fmt.Errorf("handler: %w", err)
+
+if errors.As(wrapped, &appErr) {
+    // errors.As walked the chain, found *AppError, made appErr POINT TO IT
+    // appErr was nil — now it points to the &AppError{} returned by getUser
+    // nothing was overwritten — appErr just stopped being nil
+    fmt.Println("status code:", appErr.StatusCode) // 404
+}
+```
+
+**how the pointer mechanics work:**
+
+```go
+var appErr *AppError    // separate nil pointer — no struct in memory yet
+                        // &AppError{} from getUser is a different struct entirely
+
+errors.As(err, &appErr) // walks chain
+                        // finds *AppError in the chain
+                        // makes appErr point to that struct
+                        // appErr.StatusCode now works
+```
+
+second argument must be a pointer — `errors.As` needs an address to write to.
+
+## real world — withErrorHandling middleware
+
+same pattern as topic 11 middleware — a function that wraps another function.
+
+```go
+type HandlerFunc func(userID int) (*User, error)
+
+func withErrorHandling(h HandlerFunc) HandlerFunc {
+    return func(userID int) (*User, error) {
+        user, err := h(userID) // call the actual handler
+        if err == nil {
+            return user, nil
+        }
+
+        // classify the error — check most specific first
+        var appErr *AppError
+        if errors.As(err, &appErr) {
+            fmt.Printf("app error — status %d: %s\n", appErr.StatusCode, appErr.Message)
+        } else if errors.Is(err, ErrUnauthorized) {
+            fmt.Println("sentinel: unauthorized")
+        } else if errors.Is(err, ErrInvalidUserID) {
+            fmt.Println("sentinel: invalid user id")
+        } else {
+            fmt.Println("generic error:", err)
+        }
+
+        return nil, err
+    }
+}
+```
+
+calling it — pass the function itself, not the result:
+
+```go
+// wrong — getProfile(25) returns (*User, error), not HandlerFunc
+withErrorHandling(getProfile(25))
+
+// correct — pass the function, call the wrapper
+handler := withErrorHandling(getProfile)
+user, err := handler(25)
+```
+
+this is the same thing as `logger(greetHandler)` from topic 11. the middleware wraps the function, you call the wrapper.
+
+## gotchas
+
+```go
+// error messages must be lowercase — they get chained mid-sentence
+fmt.Errorf("User not found")  // wrong
+fmt.Errorf("user not found")  // correct
+// "failed to create user: User not found" — capital looks wrong mid-sentence
+// "failed to create user: user not found" — reads naturally
+
+// %w on nil — don't do this
+return fmt.Errorf("repo: %w", nil) // produces %!w(<nil>)
+// guard first
+if err == nil { return nil }
+return fmt.Errorf("repo: %w", err)
+
+// AppError{} value not pointer — won't satisfy error interface
+// Error() is on *AppError — pointer receiver
+return nil, AppError{...}   // compile error if return type is error
+return nil, &AppError{...}  // correct
+
+// errors.As needs a pointer as second arg
+var appErr *AppError
+errors.As(err, appErr)   // nil pointer — panics
+errors.As(err, &appErr)  // correct — gives As an address to write to
+
+// errors.Is checks value, errors.As checks type
+errors.Is(err, ErrNotFound)    // is this exact sentinel in the chain?
+errors.As(err, &appErr)        // is there an *AppError anywhere in the chain?
+```
