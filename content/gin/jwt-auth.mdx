@@ -1,0 +1,305 @@
+---
+title: jwt auth flow
+desc: how register, login, and refresh token work in my go/gin ecom backend — the why behind every decision
+tag: go
+---
+
+## the full picture
+
+two tokens, two jobs:
+
+- **access token** — short lived (15min), used on every request, stateless, never stored in db
+- **refresh token** — long lived (30d), used only to get a new access token, stored in db as a hash
+
+---
+
+## register
+
+```go
+// 1. hash the password — bcrypt is slow on purpose (brute force protection)
+hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+
+// 2. save user to db with hashed password, never plain text
+user, err := queries.CreateUser(ctx, dbgen.CreateUserParams{
+    Name:         req.Name,
+    Email:        req.Email,
+    PasswordHash: string(hashedPassword),
+    Role:         "customer",
+})
+
+// 3. check duplicate email properly — match postgres error code, not string
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+    // unique violation
+}
+
+// 4. generate both tokens and set cookies
+```
+
+---
+
+## why bcrypt and not sha256 for passwords
+
+bcrypt is intentionally slow — makes brute forcing millions of guesses expensive.
+sha256 is instant — fine for random tokens (not guessable anyway), wrong for passwords.
+
+```bash
+passwords       → bcrypt   (slow, brute force protection)
+random tokens   → sha256   (instant, just need safe storage)
+```
+
+---
+
+## login
+
+```go
+// 1. fetch user by email
+user, err := queries.GetUserByEmail(ctx, req.Email)
+
+// 2. compare — bcrypt re-hashes the plain password using the salt
+// embedded inside the stored hash, then compares. you never compare plain text.
+err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password))
+
+// always return the same vague message — don't hint which field was wrong
+c.JSON(400, gin.H{"message": "invalid credentials"})
+
+// 3. generate tokens
+```
+
+---
+
+## token generation
+
+two separate secrets — one for each token type. if same secret is used, a refresh
+token could be submitted where an access token is expected.
+
+```go
+// access token — short lived, carries user context for every request
+accessClaims := jwt.MapClaims{
+    "user_id": user.ID,
+    "email":   user.Email,
+    "role":    user.Role,   // role here so middleware never hits db
+    "exp":     time.Now().Add(15 * time.Minute).Unix(),
+}
+
+// refresh token — minimal claims, its only job is proving valid session
+refreshClaims := jwt.MapClaims{
+    "user_id": user.ID,
+    "exp":     time.Now().Add(30 * 24 * time.Hour).Unix(),
+}
+
+// sign with separate secrets
+accessToken.SignedString([]byte(cfg.JWTAccessSecret))
+refreshToken.SignedString([]byte(cfg.JWTRefreshSecret))
+```
+
+why no email/role in refresh token — refresh token lives 30 days. if role changes
+mid-session, stale claims in a long lived token is a problem. instead, on every
+refresh we fetch fresh user data from db and build a new access token with current values.
+
+---
+
+## storing the refresh token
+
+never store the raw token — hash it first. same reason you don't store plain passwords.
+if db leaks, raw refresh tokens are just as dangerous.
+
+```go
+// sha256 is deterministic — same input always produces same hash
+// so when user sends the token back, hash it and look it up in db
+hash := sha256.Sum256([]byte(refreshTokenString))
+tokenHash := fmt.Sprintf("%x", hash)
+
+queries.CreateRefreshToken(ctx, dbgen.CreateRefreshTokenParams{
+    UserID:    user.ID,
+    TokenHash: tokenHash,
+    ExpiresAt: pgtype.Timestamptz{
+        Time:  time.Now().Add(30 * 24 * time.Hour),
+        Valid:  true,   // Valid: false = NULL in db
+    },
+})
+```
+
+---
+
+## cookies
+
+```go
+// access token — all paths
+c.SetCookie("access_token", accessTokenString, 15*60, "/", "", true, true)
+
+// refresh token — scoped to /auth only
+// browser only sends this cookie when hitting /auth/* routes
+// not sent on every api request which is what you want
+c.SetCookie("refresh_token", refreshTokenString, 30*24*60*60, "/auth", "", true, true)
+
+// args: name, value, maxAge (seconds), path, domain, secure, httpOnly
+```
+
+---
+
+## refresh flow
+
+called automatically by axios interceptor when any request returns 401.
+
+```go
+// 1. validate jwt signature first — catches tampered or expired tokens
+token, err := jwt.Parse(refreshTokenString, func(token *jwt.Token) (interface{}, error) {
+    // check algorithm before returning secret
+    // without this, attacker could send alg:none and skip verification entirely
+    if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+        return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+    }
+    return []byte(cfg.JWTRefreshSecret), nil
+})
+
+// 2. hash incoming token and check db
+hash := sha256.Sum256([]byte(refreshTokenString))
+tokenHash := fmt.Sprintf("%x", hash)
+dbToken, err := queries.GetRefreshToken(ctx, tokenHash)
+
+// 3. delete old token before creating new one — order matters
+// if you insert first and delete fails, two valid tokens exist in db
+err = queries.DeleteRefreshToken(ctx, tokenHash)
+
+// 4. fetch fresh user data — so access token has current role/email
+user, err := queries.GetUserByID(ctx, dbToken.UserID)
+
+// 5. issue new tokens, save new refresh token hash, set new cookies
+```
+
+---
+
+## how jwt validation works under the hood
+
+```bash
+token: xxxxx.yyyyy.zzzzz
+         ↑       ↑      ↑
+       header  payload  signature  ← all base64 encoded
+
+jwt.Parse does:
+1. decode header  → { alg: HS256 }
+2. decode payload → { user_id: 1, exp: ... }
+3. HMAC-SHA256(header + payload, your_secret) → compare against signature
+4. if match → valid, if not → tampered
+```
+
+the db check catches what jwt validation can't:
+
+```bash
+valid signature but stolen token → not in db (already rotated) // wrong
+valid signature but expired      → exp < now // wrong
+valid signature, in db, not exp  → // correct
+```
+
+---
+
+## rotation — why refresh tokens are single use
+
+every time a refresh token is used, it's deleted and a new one is issued.
+
+if someone steals a refresh token and uses it, the real user's next request fails
+because the token is already gone from db. you know a theft happened and can
+invalidate everything.
+
+without rotation, a stolen refresh token works silently for its entire 30 day lifetime.
+
+---
+
+## logout
+
+```go
+// 1. delete from db — this is the actual invalidation
+queries.DeleteRefreshToken(ctx, tokenHash)
+
+// 2. clear cookies — set maxAge to 0
+c.SetCookie("access_token", "", 0, "/", "", true, true)
+c.SetCookie("refresh_token", "", 0, "/auth", "", true, true)
+```
+
+note: you can't truly invalidate an access token — it's stateless. once issued it's
+valid until expiry. keeping it at 15min means worst case a stolen access token works
+for 15min max. for instant invalidation you'd need a redis blocklist — overkill for now.
+
+---
+
+## gotchas
+
+### pgtype timestamp
+
+`time.Now().Add(...).Unix()` returns `int64` — pgtype won't accept it directly.
+
+```go
+// wrong
+ExpiresAt: time.Now().Add(7 * 24 * time.Hour).Unix() // int64, pgtype rejects this
+
+// correct
+ExpiresAt: pgtype.Timestamptz{
+    Time:  time.Now().Add(7 * 24 * time.Hour), // time.Time, not unix
+    Valid: true,                                // false = NULL in db
+}
+```
+
+### request context
+
+always use `c.Request.Context()` in handlers, not `context.Background()`.
+
+```go
+ctx := c.Request.Context() // cancels if client disconnects
+ctx := context.Background() // never cancels — wrong in handlers
+```
+
+### db error detection
+
+string matching on error messages is fragile — driver changes break it silently.
+
+```go
+// fragile
+strings.Contains(err.Error(), "duplicate key")
+
+// correct
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+    // unique violation — always reliable
+}
+```
+
+### never log sensitive data
+
+```go
+log.Println("password: ", req.Password) // never
+log.Println("user: ", user)             // never — struct contains password_hash
+log.Println("error: ", err)             // fine
+log.Println("user_id: ", user.ID)       // fine
+```
+
+### []byte in crypto
+
+every crypto function works on raw bytes, not strings. just read `[]byte(x)` as "give me the raw bytes of x".
+
+```go
+[]byte("mysecret")           // string → bytes, for signing
+string(hashedPassword)       // bytes → string, for storing
+fmt.Sprintf("%x", hash)      // bytes → hex string, for storing sha256
+hex.EncodeToString(hash[:])  // same as above, more explicit
+```
+
+## sqlc queries needed
+
+```sql
+-- name: CreateRefreshToken :one
+INSERT INTO refresh_tokens (user_id, token_hash, expires_at)
+VALUES ($1, $2, $3)
+RETURNING *;
+
+-- name: GetRefreshToken :one
+SELECT * FROM refresh_tokens WHERE token_hash = $1;
+
+-- name: DeleteRefreshToken :exec
+DELETE FROM refresh_tokens WHERE token_hash = $1;
+
+-- name: DeleteAllUserRefreshTokens :exec
+DELETE FROM refresh_tokens WHERE user_id = $1;
+```
+
+the last one is for "logout all devices" — delete every refresh token tied to a user.
