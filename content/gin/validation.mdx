@@ -1,0 +1,266 @@
+---
+title: request validation
+desc: how gin binding, validation errors, and api responses are structured in cartspace
+tag: go
+---
+
+## the three files
+
+```bash
+types/auth.go       ← request structs with binding rules
+types/response.go   ← shared response + error shapes
+internal/validator  ← turns gin's validation errors into clean json
+```
+
+kept separate on purpose — `APIResponse` and `AppError` are used everywhere
+(handlers, middleware, future routes). putting them in `auth.go` would be wrong.
+
+---
+
+## types/auth.go
+
+```go
+type RegisterRequest struct {
+    Name     string `json:"name"     binding:"required,min=2,max=50"`
+    Email    string `json:"email"    binding:"email,required"`
+    Password string `json:"password" binding:"required,min=8,max=50"`
+}
+
+type LoginRequest struct {
+    Email    string `json:"email"    binding:"email,required"`
+    Password string `json:"password" binding:"required"`
+}
+```
+
+the `binding` tag is gin's validation — it uses `go-playground/validator` under
+the hood. gin reads these tags during `ShouldBindJSON` and runs each rule against
+the parsed value.
+
+rules used:
+
+- `required` — field must be present and non-zero
+- `min=2` — minimum length 2 (for strings, counts characters)
+- `max=50` — maximum length 50
+- `email` — must be a valid email format
+
+order matters — put `required` before `email` otherwise you get an email format
+error on an empty field which is confusing to the client.
+
+---
+
+## types/response.go
+
+```go
+type AppError struct {
+    Code    string `json:"code"`
+    Field   string `json:"field,omitempty"`
+    Message string `json:"message"`
+}
+
+type APIResponse struct {
+    Success bool       `json:"success"`
+    Message string     `json:"message,omitempty"`
+    Errors  []AppError `json:"errors,omitempty"`
+}
+```
+
+`omitempty` means the field is omitted from json entirely if empty/nil — so a
+success response with no errors doesn't send `"errors": null`, it just skips it.
+
+what the client receives:
+
+```json
+// success
+{ "success": true, "message": "user created successfully" }
+
+// validation failure
+{
+  "success": false,
+  "message": "invalid request body",
+  "errors": [
+    { "code": "TOO_SHORT", "field": "password", "message": "password must be at least 8 characters" },
+    { "code": "INVALID_EMAIL", "field": "email", "message": "invalid email format" }
+  ]
+}
+```
+
+`code` → frontend handles programmatically (highlight field, show specific ui)
+`field` → which input to mark as invalid
+`message` → what to display to the user
+
+---
+
+## validator/parse.go
+
+### entry point
+
+```go
+func Parse(err error, obj any) []types.AppError {
+    var ve validator.ValidationErrors
+
+    // errors.As checks if err (or anything wrapping it) is ValidationErrors
+    // if the error is something else entirely (malformed json, wrong type)
+    // it falls through to the generic error below
+    if !errors.As(err, &ve) {
+        return []types.AppError{
+            {Code: "INVALID_REQUEST", Message: "Invalid request body"},
+        }
+    }
+
+    var errs []types.AppError
+
+    for _, fe := range ve {
+        // resolve json field name once, pass to both Field and Message
+        jsonField := getJSONFieldName(obj, fe)
+        errs = append(errs, types.AppError{
+            Code:    mapTagToCode(fe.Tag()),
+            Field:   jsonField,
+            Message: buildMessage(fe, jsonField),
+        })
+    }
+
+    return errs
+}
+```
+
+`validator.ValidationErrors` is a slice — one entry per failed field. so if name,
+email, and password all fail, you get all three errors back at once, not just the first.
+
+### why we pass registerRequest into Parse
+
+```go
+var registerRequest types.RegisterRequest
+
+if err := c.ShouldBindJSON(&registerRequest); err != nil {
+    c.JSON(http.StatusBadRequest, types.APIResponse{
+        Success: false,
+        Message: "Invalid request body.",
+        Errors:  validator.Parse(err, registerRequest), // ← here
+    })
+    return
+}
+```
+
+`go-playground/validator` gives you `fe.Field()` which returns the Go struct field
+name — `Password`, `Email`, `Name`. but the client sent `password`, `email`, `name`
+(the json keys). they don't know what your Go struct is called.
+
+so we pass the struct into `Parse` to look up the actual json tag via reflection:
+
+```go
+func getJSONFieldName(obj any, fe validator.FieldError) string {
+    t := reflect.TypeOf(obj)
+
+    // if someone passes a pointer (*RegisterRequest), unwrap it first
+    if t.Kind() == reflect.Ptr {
+        t = t.Elem()
+    }
+
+    // look up the Go struct field by name (fe.StructField() = "Password")
+    field, ok := t.FieldByName(fe.StructField())
+    if !ok {
+        return strings.ToLower(fe.Field()) // fallback
+    }
+
+    // read the json tag: `json:"password"`
+    tag := field.Tag.Get("json")
+    if tag == "" {
+        return strings.ToLower(fe.Field())
+    }
+
+    // strip ",omitempty" or any other options — only want the name part
+    name := strings.Split(tag, ",")[0]
+    if name == "" {
+        return strings.ToLower(fe.Field())
+    }
+
+    return name // "password", not "Password"
+}
+```
+
+without this, client gets `"field": "Password"` which doesn't match what they sent.
+with this, client gets `"field": "password"` — matches their request exactly.
+
+### mapTagToCode
+
+```go
+func mapTagToCode(tag string) string {
+    switch tag {
+    case "required": return "REQUIRED_FIELD"
+    case "min":      return "TOO_SHORT"
+    case "max":      return "TOO_LONG"
+    case "email":    return "INVALID_EMAIL"
+    default:         return "VALIDATION_ERROR"
+    }
+}
+```
+
+translates validator's internal tag names to your own error codes. frontend can
+`switch` on these to decide what to do — show a red border, display a specific
+message, focus a field etc.
+
+### buildMessage
+
+```go
+func buildMessage(fe validator.FieldError, jsonField string) string {
+    switch fe.Tag() {
+    case "required":
+        return fmt.Sprintf("%s is required", jsonField)
+    case "min":
+        // fe.Param() returns the rule's parameter — "8" from min=8
+        return fmt.Sprintf("%s must be at least %s characters", jsonField, fe.Param())
+    case "max":
+        return fmt.Sprintf("%s cannot exceed %s characters", jsonField, fe.Param())
+    case "email":
+        return "invalid email format"
+    default:
+        return fmt.Sprintf("%s is invalid", jsonField)
+    }
+}
+```
+
+takes `jsonField` not `fe.Field()` — so message says `"password must be at least 8
+characters"` not `"Password must be at least 8 characters"`.
+
+`fe.Param()` gives you the rule's value — `min=8` gives `"8"`, `max=50` gives `"50"`.
+so messages stay accurate without hardcoding limits.
+
+---
+
+## gotchas
+
+### errors.As vs errors.Is
+
+```go
+// errors.Is — checks if err == target (exact match or sentinel)
+// errors.As — checks if err (or anything wrapping it) can be unwrapped into target type
+
+// gin wraps the validation error, so errors.Is won't find it
+// errors.As unwraps until it finds ValidationErrors — always use As here
+errors.As(err, &ve)
+```
+
+### passing pointer vs value to Parse
+
+```go
+validator.Parse(err, registerRequest)   // value — works, reflect.TypeOf gets the type
+validator.Parse(err, &registerRequest)  // pointer — also works, getJSONFieldName handles Ptr
+```
+
+both work because `getJSONFieldName` checks `t.Kind() == reflect.Ptr` and unwraps.
+but passing value is cleaner since you don't need the pointer here.
+
+### adding a new validation rule
+
+say you add `binding:"required,min=2,max=50,alphanum"` to a field:
+
+```go
+// 1. add the case to mapTagToCode
+case "alphanum": return "INVALID_FORMAT"
+
+// 2. add the case to buildMessage
+case "alphanum":
+    return fmt.Sprintf("%s must contain only letters and numbers", jsonField)
+```
+
+two places, that's it. the rest of the pipeline handles it automatically.
