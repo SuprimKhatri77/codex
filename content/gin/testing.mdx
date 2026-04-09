@@ -94,22 +94,28 @@ repo := &mockAuthRepo{
 ## file structure
 
 tests live next to the file they test — not in a separate folder:
+
+```text
 internal/
-handlers/
-auth/
-register.go
-register_test.go ← right here
-login.go
-login_test.go
+  handlers/
+    auth/
+      register.go
+      register_test.go   ← right here
+      login.go
+      login_test.go
+```
 
 ## writing a test — the process
 
 **step 1** — list every branch in your handler:
-bind json fails → 400
-createUser 23505 → 400 user exists
-createUser other err → 500
-sign token fails → 500
-everything works → 200 + cookies
+
+```text
+bind json fails        → 400
+createUser 23505       → 400 user exists
+createUser other err   → 500
+sign token fails       → 500
+everything works       → 200 + cookies
+```
 
 **step 2** — write helpers once, reuse across all tests:
 
