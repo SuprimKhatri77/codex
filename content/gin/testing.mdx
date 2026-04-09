@@ -95,7 +95,7 @@ repo := &mockAuthRepo{
 
 tests live next to the file they test — not in a separate folder:
 
-```text
+```bash
 internal/
   handlers/
     auth/
@@ -109,7 +109,7 @@ internal/
 
 **step 1** — list every branch in your handler:
 
-```text
+```bash
 bind json fails        → 400
 createUser 23505       → 400 user exists
 createUser other err   → 500
