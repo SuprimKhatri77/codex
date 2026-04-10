@@ -1,52 +1,40 @@
 ---
 title: testing go handlers
-desc: how to write tests for gin handlers without losing your mind — mocks, httptest, the whole thing
+desc: how i wrote tests for gin handlers — mocks, httptest, cookies, jwts, mistakes i made
 tag: go
 ---
 
-## the idea
+## the mental model
 
-your handler has three things:
+our handler does this:
 
-- an http request coming in
-- dependencies it calls (db, config)
-- an http response going out
-
-tests let you **control the input, fake the dependencies, assert the output** — no real server, no real postgres needed.
-
-## httptest — fake requests and responses
-
-```go
-req := httptest.NewRequest(http.MethodPost, "/auth/register", body)
-req.Header.Set("Content-Type", "application/json")
-
-w := httptest.NewRecorder()
-
-router.ServeHTTP(w, req)
-
-// now assert
-w.Code             // status code
-w.Body.String()    // response body
-w.Result().Cookies() // cookies set by handler
+```bash
+HTTP Request → bind JSON → call DB → sign JWT → set cookie → HTTP Response
 ```
 
-`httptest.NewRecorder()` is just a fake `http.ResponseWriter` — it records everything the handler writes instead of sending it over the network.
+a test controls the input, fakes the dependencies, asserts the output. no real server, no real postgres.
 
-## mocking the db
+```bash
+we control   → what JSON the request sends
+we fake      → what the DB returns
+we assert    → status code, response body, cookies
+```
 
-if your handler depends on `*dbgen.Queries` directly, you can't fake it. so you define an interface instead:
+## why an interface
+
+if our handler takes `*dbgen.Queries` directly we can't fake it. define an interface instead:
 
 ```go
-// internal/repository/auth.go
 type AuthRepository interface {
     CreateUser(ctx context.Context, params dbgen.CreateUserParams) (dbgen.User, error)
     CreateRefreshToken(ctx context.Context, params dbgen.CreateRefreshTokenParams) (dbgen.RefreshToken, error)
+    GetUserByEmail(ctx context.Context, email string) (dbgen.User, error)
+    GetRefreshToken(ctx context.Context, hash string) (dbgen.RefreshToken, error)
+    DeleteRefreshToken(ctx context.Context, hash string) error
 }
 ```
 
-`*dbgen.Queries` already satisfies this — go interfaces are implicit, nothing to change in sqlc generated code.
-
-update your handler to accept the interface:
+`*dbgen.Queries` already satisfies this — go interfaces are implicit. change our handler to accept the interface:
 
 ```go
 // before
@@ -56,58 +44,123 @@ func RegisterUser(queries *dbgen.Queries, cfg *config.Config) gin.HandlerFunc
 func RegisterUser(queries repository.AuthRepository, cfg *config.Config) gin.HandlerFunc
 ```
 
-now in tests you pass a fake struct that implements the same interface:
-
-```go
-type mockAuthRepo struct {
-    createUserFn         func(ctx context.Context, params dbgen.CreateUserParams) (dbgen.User, error)
-    createRefreshTokenFn func(ctx context.Context, params dbgen.CreateRefreshTokenParams) (dbgen.RefreshToken, error)
-}
-
-func (m *mockAuthRepo) CreateUser(ctx context.Context, params dbgen.CreateUserParams) (dbgen.User, error) {
-    return m.createUserFn(ctx, params)
-}
-
-func (m *mockAuthRepo) CreateRefreshToken(ctx context.Context, params dbgen.CreateRefreshTokenParams) (dbgen.RefreshToken, error) {
-    return m.createRefreshTokenFn(ctx, params)
-}
-```
-
-each test decides what the db "returns" by swapping the func:
-
-```go
-// db succeeds
-repo := &mockAuthRepo{
-    createUserFn: func(...) (dbgen.User, error) {
-        return fakeUser(), nil
-    },
-}
-
-// db returns duplicate error
-repo := &mockAuthRepo{
-    createUserFn: func(...) (dbgen.User, error) {
-        return dbgen.User{}, &pgconn.PgError{Code: "23505"}
-    },
-}
-```
-
 ## file structure
 
-tests live next to the file they test — not in a separate folder:
+tests live next to the file they test:
 
 ```bash
 internal/
   handlers/
     auth/
       register.go
-      register_test.go   ← right here
+      register_test.go
       login.go
       login_test.go
+      logout.go
+      logout_test.go
+      helpers_test.go   ← shared mock + helpers
 ```
 
-## writing a test — the process
+## helpers_test.go
 
-**step 1** — list every branch in your handler:
+everything shared lives here — mock struct, fake data, helper fns:
+
+```go
+package authHandler_test
+
+type mockAuthRepo struct {
+    createUserFn         func(ctx context.Context, params dbgen.CreateUserParams) (dbgen.User, error)
+    createRefreshTokenFn func(ctx context.Context, params dbgen.CreateRefreshTokenParams) (dbgen.RefreshToken, error)
+    getUserByEmailFn     func(ctx context.Context, email string) (dbgen.User, error)
+    getRefreshTokenFn    func(ctx context.Context, hash string) (dbgen.RefreshToken, error)
+    deleteRefreshTokenFn func(ctx context.Context, hash string) error
+}
+
+// implement each interface method — just calls the fn
+func (m *mockAuthRepo) CreateUser(ctx context.Context, params dbgen.CreateUserParams) (dbgen.User, error) {
+    return m.createUserFn(ctx, params)
+}
+// ... rest of the methods
+```
+
+fake data helpers — always include a real bcrypt hash so login tests don't fail at password comparison:
+
+```go
+func fakeUser() dbgen.User {
+    hash, _ := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.DefaultCost)
+    return dbgen.User{
+        ID:           userID,
+        Name:         "suprim",
+        Email:        "suprim@example.com",
+        PasswordHash: string(hash),
+        Role:         "customer",
+    }
+}
+```
+
+generate a real signed JWT for tests that verify tokens:
+
+```go
+func generateRefreshToken(userID string) string {
+    claims := jwt.MapClaims{
+        "user_id": userID,
+        "exp":     time.Now().Add(7 * 24 * time.Hour).Unix(),
+    }
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    signed, _ := token.SignedString([]byte("test-refresh-secret"))
+    return signed
+}
+```
+
+setup router — each test file calls this with its own route:
+
+```go
+func setupRouter(register func(r *gin.Engine)) *gin.Engine {
+    gin.SetMode(gin.TestMode)
+    validator.Init()
+    r := gin.New()
+    register(r)
+    return r
+}
+```
+
+make request helpers:
+
+```go
+// simple request — builds and fires in one shot
+func makeRequest(t *testing.T, router *gin.Engine, method, path string, body any) *httptest.ResponseRecorder {
+    t.Helper()
+    raw, err := json.Marshal(body)
+    if err != nil {
+        t.Fatalf("marshal body: %v", err)
+    }
+    req := httptest.NewRequest(method, path, bytes.NewBuffer(raw))
+    req.Header.Set("Content-Type", "application/json")
+    w := httptest.NewRecorder()
+    router.ServeHTTP(w, req)
+    return w
+}
+
+// request with cookie — returns *http.Request so we fire it ourself
+func makeRequestWithCookie(t *testing.T, method, path string, body any, cookieName, cookieValue string) *http.Request {
+    t.Helper()
+    var buf *bytes.Buffer
+    if body != nil {
+        raw, _ := json.Marshal(body)
+        buf = bytes.NewBuffer(raw)
+    } else {
+        buf = bytes.NewBuffer(nil)
+    }
+    req := httptest.NewRequest(method, path, buf)
+    req.Header.Set("Content-Type", "application/json")
+    req.AddCookie(&http.Cookie{Name: cookieName, Value: cookieValue})
+    return req
+}
+```
+
+## writing tests — the process
+
+**step 1** — trace every `if err != nil` in our handler:
 
 ```bash
 bind json fails        → 400
@@ -117,112 +170,169 @@ sign token fails       → 500
 everything works       → 200 + cookies
 ```
 
-**step 2** — write helpers once, reuse across all tests:
+each line is one test.
+
+**step 2** — write success first, then one test per failure branch.
+
+**step 3** — keep everything ideal except the one thing the test is named after.
+
+## what the mock actually does
+
+the mock ignores all inputs and returns whatever we tell it:
 
 ```go
+getUserByEmailFn: func(_ context.Context, _ string) (dbgen.User, error) {
+    return fakeUser(), nil  // always returns this, doesn't care what email we sent
+},
+```
+
+those `_` underscores mean "ignoring this". the mock doesn't look at the email — it just returns `fakeUser()` unconditionally. so in a wrong password test the email in the request body is irrelevant — only the password matters because that's what bcrypt checks against the hash.
+
+## how httptest works
+
+```go
+// fake request — no real network
+req := httptest.NewRequest(http.MethodPost, "/auth/register", bytes.NewBuffer(raw))
+
+// fake response writer — records everything the handler writes
+w := httptest.NewRecorder()
+
+// run the handler as if a real request came in
+router.ServeHTTP(w, req)
+
+// now inspect what the handler wrote
+w.Code              // status code
+w.Body.String()     // response body JSON
+w.Result().Cookies() // cookies set via c.SetCookie
+```
+
+`router.ServeHTTP` is gin's standard `http.Handler` interface — we're skipping the real network and calling it directly:
+
+```bash
+main.go:  real network → http.Server loop → router.ServeHTTP → handler
+tests:    we          →                  → router.ServeHTTP → handler
+```
+
+the handler has no idea which path triggered it.
+
+## asserting the response
+
+```go
+// status code
+if w.Code != http.StatusOK {
+    t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
+}
+
+// response body — unmarshal back into our response struct
+var resp types.APIResponse
+json.Unmarshal(w.Body.Bytes(), &resp)
+if !resp.Success {
+    t.Errorf("expected success=true")
+}
+
+// cookies
+var hasAccess, hasRefresh bool
+for _, c := range w.Result().Cookies() {
+    if c.Name == "access_token"  { hasAccess = true }
+    if c.Name == "refresh_token" { hasRefresh = true }
+}
+if !hasAccess  { t.Errorf("access_token cookie missing") }
+if !hasRefresh { t.Errorf("refresh_token cookie missing") }
+```
+
+why unmarshal — `w.Body` is raw JSON bytes. we can't do `w.Body.Success`. unmarshal converts it back into a struct so we can check fields.
+
+why cookies are in `w` — `c.SetCookie` in gin writes a `Set-Cookie` header into the response. `w` captures all headers the handler writes, `w.Result().Cookies()` parses those headers into `[]*http.Cookie`.
+
+## sending cookies in requests
+
+handlers that read from cookie (logout, refresh) need the cookie on the **request** — not the response:
+
+```go
+req := makeRequestWithCookie(t, "POST", "/auth/logout", nil, "refresh_token", generateRefreshToken(userID))
+w := httptest.NewRecorder()
+router.ServeHTTP(w, req)
+```
+
+`makeRequestWithCookie` returns `*http.Request` not `*httptest.ResponseRecorder` — because we need to build the request first, attach the cookie, then fire it ourself.
+
+## handlers that verify JWTs
+
+if our handler verifies the JWT signature (logout, refresh), the token in the cookie must be signed with the same secret we use in `testConfig()`:
+
+```go
+// testConfig uses this secret
 func testConfig() *config.Config {
     return &config.Config{
-        JWTAccessSecret:  "test-secret",
         JWTRefreshSecret: "test-refresh-secret",
     }
 }
 
-func setupRouter(repo *mockAuthRepo) *gin.Engine {
-    gin.SetMode(gin.TestMode)
-    validator.Init()
-    r := gin.New()
-    r.POST("/auth/register", authHandler.RegisterUser(repo, testConfig()))
-    return r
-}
-
-func makeRequest(t *testing.T, router *gin.Engine, body any) *httptest.ResponseRecorder {
-    t.Helper()
-    raw, _ := json.Marshal(body)
-    req := httptest.NewRequest(http.MethodPost, "/auth/register", bytes.NewBuffer(raw))
-    req.Header.Set("Content-Type", "application/json")
-    w := httptest.NewRecorder()
-    router.ServeHTTP(w, req)
-    return w
+// generateRefreshToken signs with the same secret
+func generateRefreshToken(userID string) string {
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{...})
+    signed, _ := token.SignedString([]byte("test-refresh-secret"))
+    return signed
 }
 ```
 
-**step 3** — one test per branch:
+if secrets don't match, JWT verification fails and we never reach the DB — test fails for the wrong reason.
+
+## mistakes i made
+
+**nil pointer panic** — forgot to set a mock fn that the handler reaches on the success path:
+
+```bash
+panic: runtime error: invalid memory address or nil pointer dereference
+mockAuthRepo.CreateRefreshToken
+```
+
+fix — trace how far the handler executes for this scenario and set every fn along that path.
+
+**missing password in request body** — sent only email in login test, binding failed before hitting any logic:
 
 ```go
-func TestRegisterUser_Success(t *testing.T) {
-    repo := &mockAuthRepo{
-        createUserFn: func(_ context.Context, _ dbgen.CreateUserParams) (dbgen.User, error) {
-            return fakeUser(), nil
-        },
-        createRefreshTokenFn: func(_ context.Context, _ dbgen.CreateRefreshTokenParams) (dbgen.RefreshToken, error) {
-            return dbgen.RefreshToken{}, nil
-        },
-    }
+// wrong
+makeRequest(t, router, "POST", "/auth/login", map[string]string{
+    "email": "suprim@example.com",
+    // password missing → binding fails → 400 before anything runs
+})
 
-    w := makeRequest(t, setupRouter(repo), map[string]string{
-        "name":     "suprim",
-        "email":    "suprim@example.com",
-        "password": "secret123",
-    })
+// correct
+makeRequest(t, router, "POST", "/auth/login", map[string]string{
+    "email":    "suprim@example.com",
+    "password": "secret123",
+})
+```
 
-    if w.Code != http.StatusOK {
-        t.Errorf("expected 200, got %d — body: %s", w.Code, w.Body.String())
-    }
+**fakeUser had no password hash** — bcrypt.CompareHashAndPassword("", "secret123") always fails:
 
-    var resp types.APIResponse
-    json.Unmarshal(w.Body.Bytes(), &resp)
+```go
+// wrong
+return dbgen.User{Email: "suprim@example.com"}  // empty PasswordHash
 
-    if !resp.Success {
-        t.Errorf("expected success=true")
-    }
+// correct
+hash, _ := bcrypt.GenerateFromPassword([]byte("secret123"), bcrypt.DefaultCost)
+return dbgen.User{Email: "suprim@example.com", PasswordHash: string(hash)}
+```
 
-    // check cookies were set
-    var hasAccess, hasRefresh bool
-    for _, c := range w.Result().Cookies() {
-        if c.Name == "access_token"  { hasAccess = true }
-        if c.Name == "refresh_token" { hasRefresh = true }
-    }
-    if !hasAccess  { t.Error("access_token cookie missing") }
-    if !hasRefresh { t.Error("refresh_token cookie missing") }
+**dead code in mock** — setting a mock fn that the handler never reaches:
+
+```go
+// handler returns early on invalid JWT, never hits DB
+// this fn is never called — dead code
+repo := &mockAuthRepo{
+    deleteRefreshTokenFn: func(...) error {
+        return fmt.Errorf("some error")
+    },
 }
 
-func TestRegisterUser_DuplicateEmail(t *testing.T) {
-    repo := &mockAuthRepo{
-        createUserFn: func(_ context.Context, _ dbgen.CreateUserParams) (dbgen.User, error) {
-            return dbgen.User{}, &pgconn.PgError{Code: "23505"}
-        },
-        createRefreshTokenFn: func(_ context.Context, _ dbgen.CreateRefreshTokenParams) (dbgen.RefreshToken, error) {
-            return dbgen.RefreshToken{}, nil
-        },
-    }
-
-    w := makeRequest(t, setupRouter(repo), map[string]string{
-        "name":     "suprim",
-        "email":    "suprim@example.com",
-        "password": "secret123",
-    })
-
-    if w.Code != http.StatusBadRequest {
-        t.Errorf("expected 400, got %d", w.Code)
-    }
-
-    var resp types.APIResponse
-    json.Unmarshal(w.Body.Bytes(), &resp)
-    if resp.Message != "User already exists." {
-        t.Errorf("unexpected message: %s", resp.Message)
-    }
-}
-
-func TestRegisterUser_InvalidBody(t *testing.T) {
-    repo := &mockAuthRepo{}
-
-    w := makeRequest(t, setupRouter(repo), map[string]string{
-        "email": "not-an-email",
-    })
-
-    if w.Code != http.StatusBadRequest {
-        t.Errorf("expected 400, got %d", w.Code)
-    }
+// better — use t.Fatal to enforce it's never called
+repo := &mockAuthRepo{
+    deleteRefreshTokenFn: func(...) error {
+        t.Fatal("should not reach deleteRefreshToken with invalid token")
+        return nil
+    },
 }
 ```
 
@@ -236,25 +346,8 @@ go test ./...
 go test -v ./internal/handlers/auth/...
 
 # specific test by name
-go test -v -run TestRegisterUser_Success ./internal/handlers/auth/...
+go test -v -run ^TestRegisterUser_Success$ ./internal/handlers/auth/...
 
-# with coverage
+# coverage
 go test -cover ./...
 ```
-
-## what each test actually checks
-
-**success**
-
-- mock returns: `fakeUser(), nil`
-- assert: 200, `success=true`, both cookies set
-
-**duplicate email**
-
-- mock returns: `&pgconn.PgError{Code: "23505"}`
-- assert: 400, `"User already exists."`
-
-**invalid body**
-
-- mock returns: never called
-- assert: 400, validation errors in response
