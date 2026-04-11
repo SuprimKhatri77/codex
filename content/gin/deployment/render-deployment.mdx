@@ -1,0 +1,114 @@
+---
+title: deploying go/gin to render
+desc: how to deploy a go backend that lives inside a turborepo monorepo — build cmd, openapi path, gin mode, all the gotchas
+tag: go
+---
+
+## service setup on render
+
+when creating a new web service on render:
+
+```bash
+repo          → select your github repo
+branch        → main
+root dir      → . (leave as repo root, never change this for monorepos)
+runtime       → Go  (render defaults to Node because it sees package.json — change it)
+```
+
+never set root dir to `apps/backend` — render needs to see the full monorepo to run commands across packages.
+
+## build command
+
+depends on where your `main.go` lives:
+
+```bash
+# if main.go is at apps/backend/cmd/server/main.go
+cd packages/openapi && bun install && bun run generate && cp openapi.json ../../apps/backend/openapi.json && cd ../../apps/backend && go build -o main ./cmd/server
+
+# if main.go is at apps/backend/cmd/main.go
+cd packages/openapi && bun install && bun run generate && cp openapi.json ../../apps/backend/openapi.json && cd ../../apps/backend && go build -o main ./cmd
+
+# if main.go is at apps/backend/main.go
+cd packages/openapi && bun install && bun run generate && cp openapi.json ../../apps/backend/openapi.json && cd ../../apps/backend && go build -o main .
+```
+
+the `cp openapi.json` step is important — copies the generated file next to the binary so it can find it at runtime.
+
+## start command
+
+```bash
+# same pattern — match where your binary ends up
+apps/backend/main
+```
+
+## env vars on render
+
+```bash
+GIN_MODE=release         # not "production" — gin specifically uses "release"
+PORT=5000                # or whatever port your server listens on
+DATABASE_URL=            # your neon/postgres connection string
+JWT_ACCESS_SECRET=       # your secrets
+JWT_REFRESH_SECRET=
+OPENAPI_PATH=            # see below
+```
+
+## setting OPENAPI_PATH
+
+render runs your binary from a specific absolute path. check your deploy logs for a line like:
+
+```bash
+Generated openapi.json at /opt/render/project/go/src/github.com/YourUsername/yourrepo/apps/backend/openapi.json
+```
+
+or look for where your server starts:
+
+```bash
+source=/opt/render/project/go/src/github.com/YourUsername/yourrepo/apps/backend/cmd/server/main.go
+```
+
+set `OPENAPI_PATH` to the absolute path of `openapi.json` in your backend:
+
+```bash
+OPENAPI_PATH=/opt/render/project/go/src/github.com/YourUsername/yourrepo/apps/backend/openapi.json
+```
+
+in `main.go` the fallback looks like this:
+
+```go
+openapiPath := os.Getenv("OPENAPI_PATH")
+if openapiPath == "" {
+    openapiPath = filepath.Join("openapi.json")  // relative — works locally, breaks on render
+}
+```
+
+the relative path works locally because you run the binary from the backend folder. on render the working directory is different — always use the absolute path via env var.
+
+## mistakes i made
+
+**render defaulted to Node runtime**
+render sees `package.json` in the monorepo root and assumes Node. manually change runtime to Go.
+
+**turbo not found during build**
+
+```bash
+/usr/bin/bash: line 1: turbo: command not found
+error: script "generate" exited with code 127
+```
+
+render doesn't have turbo installed globally. don't use `turbo run generate` in the build cmd — call the script directly with bun:
+
+```bash
+cd packages/openapi && bun install && bun run generate
+```
+
+**openapi.json returning 500**
+
+```bash
+[GIN] | 500 | GET "/openapi.json"
+Document could not be loaded
+```
+
+the file was generated in `packages/openapi/` but the binary looked for it relative to its own working directory. fix — copy the file to `apps/backend/` during build and set `OPENAPI_PATH` to the absolute path on render.
+
+**set root dir to apps/backend**
+build cmd failed because `cd packages/openapi` doesn't exist relative to `apps/backend`. always leave root dir as `.`.
