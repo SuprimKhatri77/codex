@@ -1,0 +1,236 @@
+---
+title: generics
+desc: write functions and structs that work for multiple types without repeating code or losing type safety. go 1.18+.
+tag: go
+---
+
+before generics, if you wanted a function that worked on multiple types you had two options — write it multiple times, or use `interface{}` and lose type safety. generics fix both.
+
+```go
+// without generics — redundant
+func sumInts(nums []int) int       { ... }
+func sumFloats(nums []float64) float64 { ... }
+
+// with generics — one function, type safe
+func sum[T int | float64](nums []T) T { ... }
+```
+
+## basic generic function
+
+```go
+// [T int | float64] — T can be int or float64, caller decides
+func sum[T int | float64](nums []T) T {
+    var total T // zero value of T — works for any type
+    for _, v := range nums {
+        total += v
+    }
+    return total
+}
+
+sum([]int{1, 2, 3, 4, 5})       // 15     — T inferred as int
+sum([]float64{1.1, 2.2, 3.3})   // 6.6    — T inferred as float64
+```
+
+## type constraints — reusable interfaces
+
+instead of listing types inline, define a constraint:
+
+```go
+type Number interface {
+    int | int32 | int64 | float32 | float64
+}
+
+func sum[T Number](nums []T) T {
+    var total T
+    for _, v := range nums {
+        total += v
+    }
+    return total
+}
+
+func min[T Number](a, b T) T {
+    if a < b { return a }
+    return b
+}
+```
+
+constraints are interfaces — but only usable as generic constraints, not as regular parameter types.
+
+## generic zero value — `var zero T`
+
+you can't write `T{}` for a generic type — it doesn't work for `int`, `string`, `bool`. the idiomatic way to get the zero value of any generic type:
+
+```go
+func (s *Stack[T]) Pop() (T, error) {
+    var zero T // zero value — 0 for int, "" for string, false for bool
+    if len(s.items) == 0 {
+        return zero, fmt.Errorf("stack is empty")
+    }
+    // ...
+}
+```
+
+## generic structs
+
+`[T any]` on a struct means the struct works with any type. T is a placeholder — caller decides at creation.
+
+```go
+type Stack[T any] struct {
+    items []T  // items type decided by caller
+}
+
+// methods use the same T
+func (s *Stack[T]) Push(val T) {
+    s.items = append(s.items, val)
+}
+
+// caller picks the type
+intStack    := &Stack[int]{}     // items is []int
+stringStack := &Stack[string]{}  // items is []string
+todoStack   := &Stack[Todo]{}    // items is []Todo
+```
+
+stack is LIFO — last in, first out. push and pop from the end, not the front.
+
+```go
+// correct — LIFO
+func (s *Stack[T]) Pop() (T, error) {
+    var zero T
+    if len(s.items) == 0 { // use len() == 0 not == nil
+        return zero, fmt.Errorf("stack is empty")
+    }
+    top := s.items[len(s.items)-1]     // last element
+    s.items = s.items[:len(s.items)-1] // remove last
+    return top, nil
+}
+
+func (s *Stack[T]) Peek() (T, error) {
+    var zero T
+    if len(s.items) == 0 {
+        return zero, fmt.Errorf("stack is empty")
+    }
+    return s.items[len(s.items)-1], nil // read last, don't remove
+}
+```
+
+## comparable constraint
+
+`comparable` means T supports `==` and `!=`. nothing to do with the return type — it's about what operations you can perform on T inside the function.
+
+```go
+func contains[T comparable](items []T, target T) bool {
+    for _, v := range items {
+        if v == target { // == only works because T is comparable
+            return true
+        }
+    }
+    return false
+}
+
+contains([]string{"admin", "user"}, "admin") // true
+contains([]int{1, 2, 3}, 5)                  // false
+
+// structs are comparable only if ALL fields are comparable
+type Todo struct { Title string; Completed bool } // string + bool — comparable
+contains(todos, todos[0])                          // works
+
+type Post struct { Tags []string } // slice field — NOT comparable
+contains(posts, posts[0])          // compile error
+```
+
+## functions as parameters — fn func(T) bool
+
+when you see `fn` as a parameter, you provide the implementation at the call site:
+
+```go
+func filter[T any](items []T, fn func(T) bool) []T {
+    result := []T{} // empty slice — not nil
+    for _, v := range items {
+        if fn(v) {
+            result = append(result, v)
+        }
+    }
+    return result // always return slice, never nil
+                  // caller can range safely without nil check
+}
+
+// way 1 — inline anonymous function (most common)
+completed := filter(todos, func(t Todo) bool {
+    return t.Completed // your logic here
+})
+
+// way 2 — named function
+func isCompleted(t Todo) bool { return t.Completed }
+completed := filter(todos, isCompleted)
+```
+
+two type parameters — input and output can be different types:
+
+```go
+// T = input type, R = output type
+func mapSlice[T any, R any](items []T, fn func(T) R) []R {
+    result := []R{}
+    for _, v := range items {
+        result = append(result, fn(v))
+    }
+    return result
+}
+
+// T=Todo, R=string — []Todo becomes []string
+titles := mapSlice(todos, func(t Todo) string {
+    return t.Title
+})
+// titles is []string — ["first", "second", "third"]
+```
+
+## generic api response — type safe vs interface{}
+
+```go
+type APIResponse[T any] struct {
+    Success bool   `json:"success"`
+    Message string `json:"message"`
+    Data    T      `json:"data,omitempty"`
+}
+
+func respond[T any](success bool, message string, data T) APIResponse[T] {
+    return APIResponse[T]{Success: success, Message: message, Data: data}
+    // don't marshal inside this function — side effect
+    // let the caller decide what to do with the response
+}
+```
+
+what you gain over `interface{}`:
+
+```go
+// interface{} version — type assertion needed, panics if wrong
+res := APIResponse{Data: todo}
+title := res.Data.(*Todo).Title // panics at runtime if Data isn't *Todo
+
+// generic version — compiler knows the type
+res := respond(true, "ok", todo)  // APIResponse[Todo]
+title := res.Data.Title           // works directly, no assertion, no panic
+```
+
+## gotchas
+
+```go
+// T{} doesn't work for generic zero value
+var zero T  // correct — works for int, string, bool, struct, anything
+zero := T{} // wrong — compile error for int, string, bool
+
+// use len() == 0 not == nil for empty check in generics
+if s.items == nil { }     // wrong — emptied slice is [] not nil
+if len(s.items) == 0 { }  // correct — works for nil and empty
+
+// stack vs queue confusion
+s.items[0]                 // front — queue (FIFO)
+s.items[len(s.items)-1]    // back  — stack (LIFO)
+
+// comparable doesn't mean the return type is bool
+// it just means you can use == on T inside the function
+func contains[T comparable] — comparable = allows ==, bool is just this function's return
+
+// type constraints can't be used as regular param types
+func sum(nums []Number) Number { } // compile error — Number is a constraint not a type
+func sum[T Number](nums []T) T { } // correct
+```
