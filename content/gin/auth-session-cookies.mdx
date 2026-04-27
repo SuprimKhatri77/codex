@@ -1,0 +1,471 @@
+---
+title: auth, sessions, cookies, and a lot of pain
+desc: everything that went wrong building cross-domain httponly cookie auth with next.js middleware and go — and how we fixed it
+tag: go
+---
+
+## the setup
+
+turborepo monorepo. go/gin backend on render at `api.sms.suprimkhatri.com.np`. next.js frontend on vercel, later moved to `sms.suprimkhatri.com.np`. postgres on neon. httponly cookies for auth. jwt access + refresh tokens.
+
+sounds clean. wasn't.
+
+---
+
+## mistake 1: revoking all sessions on login
+
+early on, the login handler had this:
+
+```go
+err = queries.RevokeAllUserRefreshTokens(ctx, user.ID)
+```
+
+the idea was "clean slate on login". the reality was: login on chrome, all other browser sessions die. open the app on zen browser, login there, chrome's refresh token is now revoked. next time chrome tries to silently refresh — it can't. infinite redirects.
+
+fix: remove it entirely. each browser should have its own independent session.
+
+---
+
+## mistake 2: no session tracking — enter session_id
+
+the refresh tokens table was:
+
+```sql
+id, user_id, token_hash, expires_at, revoked_at
+```
+
+no way to identify which browser a token belongs to. you can do logout-all (revoke by `user_id`) but not logout-one-device.
+
+added `session_id`:
+
+```sql
+alter table refresh_tokens
+add column session_id uuid not null;
+
+create index idx_refresh_tokens_session_id on refresh_tokens(session_id);
+```
+
+down migration:
+
+```sql
+drop index if exists idx_refresh_tokens_session_id;
+alter table refresh_tokens drop column session_id;
+```
+
+on login, generate a new session:
+
+```go
+sessionID := uuid.New() // github.com/google/uuid
+
+refreshClaims := jwt.MapClaims{
+    "user_id":    user.ID,
+    "session_id": sessionID,
+    "exp":        time.Now().Add(30 * 24 * time.Hour).Unix(),
+}
+```
+
+store it:
+
+```go
+_, err = queries.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
+    UserID:    user.ID,
+    TokenHash: refreshTokenHashString,
+    ExpiresAt: expiresAt,
+    SessionID: pgtype.UUID{Bytes: sessionID, Valid: true},
+})
+```
+
+on rotate, extract `session_id` from claims, look up by both:
+
+```sql
+-- name: GetRefreshToken :one
+select * from refresh_tokens
+where session_id = $1 and token_hash = $2
+  and revoked_at is null and expires_at > now();
+```
+
+on rotate, keep the same `session_id`, just new `token_hash`:
+
+```go
+refreshClaims := jwt.MapClaims{
+    "user_id":    user.ID,
+    "session_id": sessionID, // same one from the old token's claims
+    "exp":        time.Now().Add(30 * 24 * time.Hour).Unix(),
+}
+```
+
+session lifecycle:
+
+- **login** → new `session_id` born
+- **every refresh** → same `session_id`, new token hash
+- **logout** → revoke by `session_id`
+
+tabs in the same browser share cookies so they share the same `session_id`. incognito = separate cookie jar = new session.
+
+---
+
+## mistake 3: setting the wrong token in the cookie after rotation
+
+this one was dumb but easy to miss. after generating a new refresh token:
+
+```go
+// wrong — sending the OLD token back in the cookie
+utils.SetAuthCookie(c, "refresh_token", refreshTokenString, 30*24*60*60, cfg)
+
+// correct
+utils.SetAuthCookie(c, "refresh_token", newRefreshTokenString, 30*24*60*60, cfg)
+```
+
+the old token was already revoked in the db. browser keeps it. next refresh — token not found. infinite redirects.
+
+---
+
+## cookie domain: local vs prod
+
+in local dev, cookies with no domain set just work on `localhost`. in prod on a real domain with `secure=true` and `httponly=true`, the browser is strict. cookies must have the correct domain set or they won't apply across subdomains.
+
+pattern — check gin mode and set domain conditionally:
+
+```go
+func SetAuthCookie(c *gin.Context, name, value string, maxAge int, cfg *config.Config) {
+    secure := cfg.GinMode == "release"
+    domain := ""
+    if secure {
+        domain = ".sms.suprimkhatri.com.np" // leading dot = all subdomains
+    }
+    c.SetCookie(name, value, maxAge, "/", domain, secure, true)
+}
+```
+
+use it everywhere — login, rotate, logout:
+
+```go
+utils.SetAuthCookie(c, "access_token", accessTokenString, 15*60, cfg)
+utils.SetAuthCookie(c, "refresh_token", newRefreshTokenString, 30*24*60*60, cfg)
+
+// logout
+utils.SetAuthCookie(c, "access_token", "", -1, cfg)
+utils.SetAuthCookie(c, "refresh_token", "", -1, cfg)
+```
+
+for clearing cookies to work, the attributes (domain, path, secure) **must match** what was used when the cookie was originally set. if they don't, the browser treats it as a different cookie and ignores the clear.
+
+---
+
+## cross-domain cookies: the actual problem
+
+backend: `api.sms.suprimkhatri.com.np`
+frontend (initially): `sms-web-tan.vercel.app`
+
+cookies set by the backend on its domain cannot be sent to a completely different domain. browser security. so the frontend never received the auth cookies at all.
+
+fix: add a custom domain to vercel. point `sms.suprimkhatri.com.np` to vercel. now both share the `.sms.suprimkhatri.com.np` parent domain and the cookies work.
+
+---
+
+## cloudflare blocking server-side fetches
+
+after adding the custom domain, next.js middleware was making server-side fetches to the api to verify sessions. cloudflare saw requests coming from vercel's servers and blocked them with a 403 bot challenge.
+
+quickest fix for an api subdomain: turn off the cloudflare proxy (orange cloud → grey cloud / dns only) for `api.sms.suprimkhatri.com.np`.
+
+if you need the proxy on, the proper fix is a shared secret header + cloudflare waf rule:
+
+```typescript
+// next.js middleware fetch
+fetch(`${apiUrl}/api/v1/auth/me`, {
+  headers: {
+    "x-internal-secret": process.env.INTERNAL_SECRET!,
+    cookie: req.headers.get("cookie") ?? "",
+  },
+});
+```
+
+then in cloudflare → security → waf → custom rules:
+
+- expression: `http.request.headers["x-internal-secret"] eq "your-secret"`
+- action: skip → bot fight mode
+
+---
+
+## the infinite redirect loop
+
+the nastiest bug. here's the cycle:
+
+1. user hits `/admin`
+2. middleware: no access token, has refresh token → calls `/auth/refresh`
+3. backend: refresh token revoked → returns 401
+4. middleware: `!res.ok` → redirect to `/auth`
+5. `/auth` is a public route, middleware checks for refresh token cookie
+6. **the cookie is still in the request** — middleware redirects to `/admin`
+7. go to step 2, repeat forever
+
+the fix has two parts:
+
+**part 1: backend clears cookies on invalid refresh token**
+
+```go
+if errors.Is(err, pgx.ErrNoRows) {
+    utils.SetAuthCookie(c, "access_token", "", -1, cfg)
+    utils.SetAuthCookie(c, "refresh_token", "", -1, cfg)
+
+    c.JSON(http.StatusUnauthorized, types.APIResponse{
+        Success: false,
+        Message: "Invalid refresh token",
+        Code:    constants.InvalidRefreshToken,
+    })
+    return
+}
+```
+
+**part 2: middleware clears cookies on the redirect response**
+
+this is the tricky part. `cookies.delete()` on a redirect response doesn't reliably work in prod with `secure` + `httponly` + explicit domain. you have to set `maxAge: 0` with matching attributes:
+
+```typescript
+if (!res.ok) {
+  const redirect = NextResponse.redirect(new URL("/auth", req.url));
+  redirect.cookies.set("access_token", "", {
+    maxAge: 0,
+    path: "/",
+    domain: ".sms.suprimkhatri.com.np",
+    secure: true,
+    httpOnly: true,
+  });
+  redirect.cookies.set("refresh_token", "", {
+    maxAge: 0,
+    path: "/",
+    domain: ".sms.suprimkhatri.com.np",
+    secure: true,
+    httpOnly: true,
+  });
+  return redirect;
+}
+```
+
+why does it work in local but not prod? localhost is lenient — cookies without explicit domain/secure attributes are easy to clear. in prod, if the cookie was set with `domain=.sms.suprimkhatri.com.np` and `secure=true`, you must clear it with the exact same attributes. mismatch = browser ignores the clear = loop continues.
+
+---
+
+## the full middleware setup
+
+```typescript
+export async function proxy(req: NextRequest) {
+  const { pathname } = req.nextUrl;
+
+  const isPublicRoute = PUBLIC_ROUTES.some((p) => pathname.startsWith(p));
+  const requiredRoles = Object.entries(ROLE_RULES).find(([path]) =>
+    pathname.startsWith(path),
+  )?.[1];
+
+  if (isPublicRoute) {
+    const refreshToken = req.cookies.get("refresh_token")?.value;
+    if (refreshToken) {
+      return NextResponse.redirect(new URL("/admin", req.url));
+    }
+    return NextResponse.next();
+  }
+
+  if (!requiredRoles) return NextResponse.next();
+
+  const accessToken = req.cookies.get("access_token")?.value;
+  const refreshToken = req.cookies.get("refresh_token")?.value;
+
+  if (!refreshToken) {
+    return NextResponse.redirect(new URL("/auth", req.url));
+  }
+
+  if (accessToken) {
+    const user = await getSession(accessToken);
+    if (user) {
+      if (!requiredRoles.includes(user.role)) {
+        return NextResponse.redirect(new URL("/", req.url));
+      }
+      return NextResponse.next();
+    }
+  }
+
+  return attemptRefresh(refreshToken, req, requiredRoles);
+}
+
+export const config = {
+  matcher: ["/admin/:path*", "/auth"],
+};
+```
+
+```typescript
+export async function attemptRefresh(
+  refreshToken: string,
+  req: NextRequest,
+  requiredRoles: string[],
+) {
+  try {
+    const res = await fetch(
+      `${process.env.NEXT_PUBLIC_API_URL}/api/v1/auth/refresh`,
+      {
+        method: "POST",
+        headers: { Cookie: `refresh_token=${refreshToken}` },
+      },
+    );
+
+    if (!res.ok) {
+      const redirect = NextResponse.redirect(new URL("/auth", req.url));
+      redirect.cookies.set("access_token", "", {
+        maxAge: 0,
+        path: "/",
+        domain: ".sms.suprimkhatri.com.np",
+        secure: true,
+        httpOnly: true,
+      });
+      redirect.cookies.set("refresh_token", "", {
+        maxAge: 0,
+        path: "/",
+        domain: ".sms.suprimkhatri.com.np",
+        secure: true,
+        httpOnly: true,
+      });
+      return redirect;
+    }
+
+    const cookies = res.headers.getSetCookie();
+    const newAccessToken = extractTokenFromCookie(cookies.join("; "));
+
+    if (!newAccessToken) {
+      return NextResponse.redirect(new URL("/auth", req.url));
+    }
+
+    const user = await getSession(newAccessToken);
+    if (!user) {
+      return NextResponse.redirect(new URL("/auth", req.url));
+    }
+
+    if (!requiredRoles.includes(user.role)) {
+      return NextResponse.redirect(new URL("/", req.url));
+    }
+
+    const newRefreshToken = extractRefreshTokenFromCookie(cookies.join("; "));
+
+    const response = NextResponse.next({
+      request: {
+        headers: new Headers({
+          ...Object.fromEntries(req.headers),
+          cookie: `access_token=${newAccessToken}; refresh_token=${newRefreshToken}`,
+        }),
+      },
+    });
+
+    cookies.forEach((cookie) => {
+      response.headers.append("set-cookie", cookie);
+    });
+
+    return response;
+  } catch {
+    return NextResponse.redirect(new URL("/auth", req.url));
+  }
+}
+```
+
+---
+
+## axios interceptor (client-side equivalent)
+
+the middleware handles server-side. axios handles client-side fetches — same idea, different layer:
+
+```typescript
+import axios from "axios";
+import type { AxiosInstance, InternalAxiosRequestConfig } from "axios";
+
+const AUTH_ENDPOINTS = ["/auth/refresh", "/auth/login", "/auth/logout"];
+
+const api: AxiosInstance = axios.create({
+  baseURL: `${process.env.NEXT_PUBLIC_API_URL}/api/v1`,
+  withCredentials: true,
+});
+
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (value?: unknown) => void;
+  reject: (reason?: unknown) => void;
+}> = [];
+
+const processQueue = (error: unknown) => {
+  failedQueue.forEach((prom) => {
+    if (error) prom.reject(error);
+    else prom.resolve();
+  });
+  failedQueue = [];
+};
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest: InternalAxiosRequestConfig & { _retry?: boolean } =
+      error.config;
+
+    if (error.response?.data?.message) {
+      error.message = error.response.data.message;
+    }
+
+    if (
+      AUTH_ENDPOINTS.some((endpoint) => originalRequest.url?.includes(endpoint))
+    ) {
+      return Promise.reject(error);
+    }
+
+    if (error.response?.status !== 401 || originalRequest._retry) {
+      return Promise.reject(error);
+    }
+
+    if (isRefreshing) {
+      return new Promise((resolve, reject) => {
+        failedQueue.push({ resolve, reject });
+      })
+        .then(() => api(originalRequest))
+        .catch((err) => Promise.reject(err));
+    }
+
+    originalRequest._retry = true;
+    isRefreshing = true;
+
+    try {
+      await api.post("/auth/refresh");
+      processQueue(null);
+      return api(originalRequest);
+    } catch (refreshError) {
+      processQueue(refreshError);
+      if (typeof window !== "undefined") {
+        window.location.href = "/auth";
+      }
+      return Promise.reject(refreshError);
+    } finally {
+      isRefreshing = false;
+    }
+  },
+);
+
+export default api;
+```
+
+when refresh fails client-side, `window.location.href = "/auth"` triggers a full navigation. the middleware then runs, sees the (now-cleared by backend) cookies are gone, and lets the user reach the login page cleanly.
+
+---
+
+## mistakes summary
+
+**RevokeAllUserRefreshTokens on login**
+kills all other sessions on every login. remove it entirely.
+
+**no session_id**
+no way to track which browser a token belongs to. can't do per-device logout.
+
+**wrong token in cookie after rotation**
+sending old `refreshTokenString` instead of `newRefreshTokenString`. old token already revoked in db, loop starts immediately.
+
+**cookie domain not set in prod**
+cookies scoped to `api.sms.suprimkhatri.com.np`, frontend at a different domain can't read them. set `domain = ".sms.suprimkhatri.com.np"` in release mode.
+
+**cookies.delete() on redirect doesn't work in prod**
+browser ignores it when cookie has explicit domain + secure attributes. use `maxAge: 0` with the exact same attributes used when setting.
+
+**frontend on a completely different domain**
+httponly cookies can't cross unrelated domains. need a shared parent domain — move frontend to a subdomain of the same root.
