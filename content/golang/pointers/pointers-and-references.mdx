@@ -1,0 +1,237 @@
+---
+title: pointers & references
+desc: "& gives you the address, * gives you the value. every &Todo{} and *User in your gin api was this. now the mechanics click."
+tag: go
+---
+
+two operators, one rule:
+
+- `&` — give me the **address** of this value
+- `*` — give me the **value** at this address
+
+```go
+x := 42
+p := &x   // p holds the memory address of x — p is *int
+
+fmt.Println(p)  // 0xc000014090 — the address
+fmt.Println(*p) // 42 — the value at that address (dereferencing)
+
+*p = 100        // go to the address p holds, write 100 there
+fmt.Println(x)  // 100 — x changed because p points to x
+```
+
+## value vs pointer in functions
+
+this is the most practical thing to understand.
+
+```go
+// value parameter — go copies the value
+// changes inside the function do NOT affect the original
+func doubleValue(n int) {
+    n = n * 2 // modifies the copy, not the original
+}
+
+// pointer parameter — go passes the address
+// changes inside the function DO affect the original
+func doublePointer(n *int) {
+    *n = *n * 2 // dereference to get value, multiply, write back
+}
+
+n := 7
+doubleValue(n)    // n is still 7
+doublePointer(&n) // n is now 14
+```
+
+real backend version:
+
+```go
+func updateEmail(u User, email string) {
+    u.email = email // modifies the copy — original user unchanged
+}
+
+func updateEmailPtr(u *User, email string) {
+    u.email = email // modifies the original — goes to the address u holds
+}
+
+user := User{email: "before@example.com"}
+
+updateEmail(user, "after@example.com")
+fmt.Println(user.email) // "before@example.com" — unchanged
+
+updateEmailPtr(&user, "after@example.com")
+fmt.Println(user.email) // "after@example.com" — changed
+```
+
+## nil pointers — always guard
+
+`var u *User` declares a pointer but no User exists in memory yet. accessing any field panics.
+
+```go
+var u *User
+fmt.Println(u)       // <nil>
+fmt.Println(u.name)  // panic: nil pointer dereference
+
+// always nil-check before accessing fields on a pointer
+func getUserName(u *User) string {
+    if u == nil {
+        return ""
+    }
+    return u.name
+}
+```
+
+nil pointer dereference is one of the most common runtime panics in go backends. guard at the top of every function that accepts a pointer.
+
+## pointers to structs — auto-dereferencing
+
+```go
+// value — stored directly
+u1 := User{name: "alice"}
+
+// pointer — stored as address to User in memory
+u2 := &User{name: "alice"}
+```
+
+`&User{}` doesn't modify anything. it creates a User in memory and gives you its address. no "original" exists separately — the struct is in one place, `&` just gives you the address to that place.
+
+when you access fields on a pointer, go auto-dereferences silently:
+
+```go
+u2.name           // go does (*u2).name internally — auto-deref
+u2.email = "x"    // go does (*u2).email = "x" internally
+
+// you never need to write this
+(*u2).name        // valid but unnecessary — go does it for you
+```
+
+every `u.Field` on a pointer is implicit dereferencing. go hides it so you don't have to.
+
+## &User{} vs User{} — when to use which
+
+```go
+// use value (no &) when:
+// - struct is small
+// - used temporarily, not passed around
+// - pure read, no mutation needed
+config := ServerConfig{Host: "localhost"}
+
+// use pointer (&) when:
+// - struct is large — passed through handler → service → repository
+// - needs to be mutated by a function
+// - returning "not found" as nil
+// - db models, request/response structs — always &
+user := &User{Name: "alice"}
+```
+
+pointer size is always 8 bytes on 64-bit systems — regardless of how large the struct is. passing `*User` through 5 layers copies 8 bytes. passing `User` copies the entire struct every time.
+
+## \*[]Todo vs []Todo — the database/sql confusion
+
+```go
+var a []Todo    // a slice — already a reference type
+var b *[]Todo   // a pointer TO the slice header
+var c *Todo     // a pointer to a single Todo struct
+```
+
+`[]Todo` is already cheap to pass — it has a pointer inside it (pointer + length + cap = 24 bytes). you're not copying all the todos when you pass a slice.
+
+`*[]Todo` is almost never needed. the one real case — `database/sql`'s `Scan`:
+
+```go
+var todos []Todo
+db.Scan(&todos)  // Scan needs *[]Todo to ASSIGN a new slice to your variable
+                 // without &, Scan writes to a copy — todos stays empty
+                 // Scan needs the address of todos to replace it entirely
+```
+
+`Scan` doesn't append to your slice — it creates a new one and assigns it. it needs the address of your variable to do that. that's `*[]Todo`.
+
+in every other case — just use `[]Todo`. `*[]Todo` is not about memory efficiency.
+
+```go
+// ranging over *[]Todo — must dereference explicitly
+todoPtr := getTodosPtr() // *[]Todo
+for _, v := range *todoPtr { // * required — can't range over a pointer
+    fmt.Println(v.title)
+}
+
+// ranging over []Todo — no dereferencing needed
+todos := getTodoSlice() // []Todo
+for _, v := range todos {
+    fmt.Println(v.title)
+}
+```
+
+## real world patterns
+
+```go
+// returns *User — nil means not found
+func findUser(id int, users []User) *User {
+    for i := range users {
+        if users[i].id == id {
+            return &users[i] // address of actual slice element
+        }
+    }
+    return nil
+}
+
+// updates in place — no return needed
+func updateUserRole(u *User, role string) {
+    u.role = role
+}
+
+// safe dereference — never panics
+func getUserEmail(u *User) string {
+    if u == nil { return "" }
+    return u.email
+}
+
+// usage
+found := findUser(2, users)
+if found == nil {
+    fmt.Println("not found")
+    return
+}
+updateUserRole(found, "admin")
+fmt.Println(getUserEmail(found))
+```
+
+## gotchas
+
+```go
+// returning address of range loop variable — classic bug
+func findUser(id int, users []User) *User {
+    for _, v := range users {
+        if v.id == id {
+            return &v  // BUG — &v is address of loop copy, not slice element
+                       // v is temporary, overwritten each iteration
+        }
+    }
+    return nil
+}
+
+// fix — use index to get address of actual element
+func findUser(id int, users []User) *User {
+    for i := range users {
+        if users[i].id == id {
+            return &users[i]  // address of actual element in slice
+        }
+    }
+    return nil
+}
+
+// passing nil to pointer receiver — panics
+updateUserRole(nil, "admin") // panic: nil pointer dereference
+// guard: if u == nil { return } at the top
+
+// *[]Todo — ranging requires explicit dereference
+for _, v := range *todoPtr { } // need the *
+for _, v := range todoPtr  { } // compile error — can't range over *[]Todo
+
+// nil interface vs nil pointer — subtle trap
+var u *User = nil
+var any interface{} = u
+fmt.Println(any == nil) // false — interface holds type info (*User)
+                        // even though the pointer value is nil
+                        // covered more in error handling with error interface
+```
