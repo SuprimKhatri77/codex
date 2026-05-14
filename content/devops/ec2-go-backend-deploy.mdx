@@ -1,0 +1,411 @@
+---
+title: deploying a go backend on aws ec2
+desc: full walkthrough — ec2 setup, nginx, ssl, systemd, and github actions ci/cd for a turborepo go backend
+tag: devops
+---
+
+## what this covers
+
+spinning up an ec2 instance, sshing in, setting up nginx as a reverse proxy, getting ssl via certbot, keeping the server alive with systemd, and wiring up github actions for auto-deploy on push. this was done for a turborepo monorepo where only the go/gin backend needed to be on ec2 — frontend was already on vercel.
+
+---
+
+## launching the ec2 instance
+
+go to [console.aws.amazon.com](https://console.aws.amazon.com) and sign in with your root user email. search for **ec2** in the search bar or find it in recently used.
+
+click **launch instance** and fill in the form:
+
+- **name**: your instance name (e.g. `my-project-backend`)
+- **ami**: amazon linux (default, comes with `dnf` package manager)
+- **architecture**: 64-bit (x86) — leave as is
+- **instance type**: `t3.micro` — 2 vcpu, 1gb ram, free tier eligible
+- **key pair**: click _create new key pair_
+  - type: RSA
+  - format: `.pem`
+  - save it somewhere safe, you'll need it every time you ssh in
+- **network settings**: tick all three
+  - allow ssh traffic from anywhere (or restrict to your ip for better security)
+  - allow https traffic from the internet
+  - allow http traffic from the internet
+
+leave storage as default (8gb gp3 is fine for a backend). click **launch instance**.
+
+---
+
+## sshing into your instance
+
+first, lock down your `.pem` file so only your user can read it:
+
+```bash
+chmod 400 ~/Downloads/your-key.pem
+```
+
+get your instance's **public ip** from the ec2 dashboard (instances → your instance → public ipv4 address).
+
+then ssh in:
+
+```bash
+ssh -i ~/Downloads/your-key.pem ec2-user@your-public-ip
+```
+
+it'll ask you to confirm the fingerprint the first time — type `yes`. you're in. `ec2-user` is the default root user on amazon linux.
+
+---
+
+## installing git and go
+
+`dnf` is the default package manager on amazon linux (like `apt` on ubuntu). the `-y` flag auto-answers yes to all prompts during install:
+
+```bash
+sudo dnf install git golang -y
+```
+
+verify:
+
+```bash
+go version
+git --version
+```
+
+---
+
+## cloning your repo and setting up env
+
+```bash
+git clone https://github.com/your-username/your-repo.git
+cd your-repo
+```
+
+your go backend reads from a `.env` file via `godotenv.Load()` which looks for `.env` in the **current working directory** when the binary runs. so put it in your backend directory.
+
+the easiest way is to scp it from your local machine. run this from your **local terminal** (not ec2) in your turborepo root:
+
+```bash
+scp -i ~/Downloads/your-key.pem .env.production ec2-user@your-public-ip:~/your-repo/apps/backend/.env
+```
+
+this copies your local `.env.production` to `apps/backend/.env` on ec2. godotenv will pick it up automatically.
+
+make sure these are set correctly in the `.env`:
+
+```dotenv
+GIN_MODE=release
+PORT=5000
+FRONTEND_URL=https://www.yourdomain.com
+COOKIE_DOMAIN=.yourdomain.com
+DATABASE_URL=...
+JWT_ACCESS_SECRET=...
+JWT_REFRESH_SECRET=...
+# ... rest of your secrets
+```
+
+a few things that'll bite you if wrong:
+
+- `GIN_MODE` must be `release` in prod — debug mode can mess with cookie behavior
+- `FRONTEND_URL` must exactly match the origin your frontend runs on (with or without www matters for cors)
+- `COOKIE_DOMAIN` needs the leading dot (`.yourdomain.com`) so cookies work across subdomains
+
+---
+
+## building and running the binary
+
+```bash
+cd your-repo/apps/backend
+go build -o server ./cmd/server
+chmod +x server
+```
+
+`go build` compiles everything into a single binary called `server`. `chmod +x` makes it executable. test it first:
+
+```bash
+./server
+```
+
+if it boots without errors, kill it with `ctrl+c` and move on to systemd.
+
+---
+
+## setting up nginx as a reverse proxy
+
+install nginx:
+
+```bash
+sudo dnf install nginx -y
+```
+
+edit the nginx config:
+
+```bash
+sudo vim /etc/nginx/nginx.conf
+```
+
+replace the contents with:
+
+```nginx
+events {
+    worker_connections 1024;
+}
+
+http {
+    server {
+        listen 80;
+        server_name api.yourdomain.com;
+
+        location / {
+            proxy_pass http://localhost:5000;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
+```
+
+this tells nginx to listen on port 80 and forward all requests to your go server on port 5000. the `proxy_set_header` lines pass along the real client ip and protocol to your app.
+
+test the config for syntax errors:
+
+```bash
+sudo nginx -t
+```
+
+start and enable nginx:
+
+```bash
+sudo systemctl start nginx
+sudo systemctl enable nginx
+```
+
+`enable` makes nginx auto-start on reboot.
+
+---
+
+## pointing your domain to ec2
+
+go to your dns provider (cloudflare in this case) and add an **A record**:
+
+- **name**: `api` (for api.yourdomain.com)
+- **ipv4 address**: your ec2 public ip
+- **proxy status**: turn off the orange cloud (set to dns only / grey cloud)
+
+the proxy must be off for the api subdomain — when cloudflare proxies the request it strips/modifies cookie headers which breaks httponly cookie handling. your frontend subdomain can stay proxied.
+
+to check if dns has propagated:
+
+```bash
+# wait a few minutes then check
+nslookup api.yourdomain.com
+```
+
+or use [whatsmydns.net](https://whatsmydns.net) to see propagation across regions.
+
+---
+
+## ssl with certbot
+
+install certbot and the nginx plugin:
+
+```bash
+sudo dnf install certbot python3-certbot-nginx -y
+```
+
+generate the ssl certificate:
+
+```bash
+sudo certbot --nginx -d api.yourdomain.com
+```
+
+certbot will automatically modify your nginx config to handle https and set up redirects from http to https. it also sets up auto-renewal via a cron job.
+
+after this your api is accessible at `https://api.yourdomain.com`.
+
+---
+
+## keeping the server alive with systemd
+
+running `./server &` or `nohup ./server &` works but dies on reboot. systemd is the proper way — it manages the process lifecycle, auto-restarts on crash, and starts on boot.
+
+create a service file:
+
+```bash
+sudo vim /etc/systemd/system/your-project.service
+```
+
+```ini
+[Unit]
+Description=Your Project Backend
+After=network.target
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/your-repo/apps/backend
+ExecStart=/home/ec2-user/your-repo/apps/backend/server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+- `WorkingDirectory` — this is where godotenv looks for `.env`, must be the backend dir
+- `ExecStart` — full absolute path to your binary
+- `Restart=on-failure` — auto-restart if the process crashes
+- `RestartSec=5` — wait 5 seconds before restarting
+
+reload systemd and start the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable your-project
+sudo systemctl start your-project
+```
+
+check status:
+
+```bash
+sudo systemctl status your-project
+```
+
+should show `active (running)`. useful commands going forward:
+
+```bash
+sudo systemctl restart your-project   # restart after rebuild
+sudo systemctl stop your-project      # stop
+sudo journalctl -u your-project -n 50 # view logs
+```
+
+---
+
+## github actions for auto-deploy
+
+every time you push to `main` with changes in `apps/backend`, this workflow sshs into ec2, pulls the latest code, rebuilds the binary, and restarts the systemd service.
+
+### adding secrets to github
+
+go to your repo on github → **settings** → **secrets and variables** → **actions** → **new repository secret**.
+
+add these three:
+
+| secret        | value                             |
+| ------------- | --------------------------------- |
+| `EC2_HOST`    | your ec2 public ip                |
+| `EC2_USER`    | `ec2-user`                        |
+| `EC2_SSH_KEY` | full contents of your `.pem` file |
+
+to copy your `.pem` contents on linux:
+
+```bash
+xsel --clipboard --input < ~/Downloads/your-key.pem
+```
+
+then paste into the secret field.
+
+### the workflow file
+
+create `.github/workflows/deploy.yml` in your repo root:
+
+```yaml
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/backend/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/your-repo
+            git pull origin main
+            cd apps/backend
+            go build -o server ./cmd/server
+            chmod +x server
+            sudo systemctl restart your-project
+```
+
+the `paths` filter means the workflow only runs when something inside `apps/backend` changes — pushing frontend changes won't trigger a backend redeploy.
+
+`runs-on: ubuntu-latest` is the github actions runner (github's server that executes the workflow) — not your ec2. it just sshs into your ec2 from there.
+
+push the workflow file to trigger a test run:
+
+```bash
+git add .github/workflows/deploy.yml
+git commit -m "ci: add backend auto deploy workflow"
+git push origin main
+```
+
+watch it run under the **actions** tab in your github repo.
+
+---
+
+## manual deploy steps (without github actions)
+
+if you need to deploy manually:
+
+```bash
+ssh -i ~/Downloads/your-key.pem ec2-user@your-public-ip
+cd ~/your-repo
+git pull origin main
+cd apps/backend
+go build -o server ./cmd/server
+chmod +x server
+sudo systemctl restart your-project
+```
+
+---
+
+## mistakes i made
+
+**ran scp from inside ec2**
+scp copies between two machines. always run it from your local terminal, not inside the ssh session.
+
+**multi-line paste froze the ssh session**
+pasting multiple lines at once into the ssh terminal freezes it and you can't type. paste line by line. if it freezes press `enter ~ .` to kill the session without closing the terminal. or disable bracketed paste mode first:
+
+```bash
+printf "\e[?2004l"
+```
+
+**cors blocking requests**
+`FRONTEND_URL` was set to `https://brewandbakeacademy.com` but the frontend ran on `https://www.brewandbakeacademy.com`. cors does exact origin matching — the www matters.
+
+**cookies not being set correctly**
+`GIN_MODE` was still `debug` in prod. always set it to `release`:
+
+```dotenv
+GIN_MODE=release
+```
+
+**cookie domain not working across subdomains**
+`COOKIE_DOMAIN` needs a leading dot so cookies are valid across all subdomains:
+
+```dotenv
+COOKIE_DOMAIN=.yourdomain.com
+```
+
+**cloudflare proxy breaking cookies**
+the orange cloud proxy was on for the api subdomain. cloudflare strips and modifies cookie headers in transit. set it to grey (dns only) for the api subdomain.
+
+**port conflict when switching to systemd**
+the `nohup` background process was still running on port 5000 when systemd tried to start. systemd kept failing with `address already in use`. always kill the old process first:
+
+```bash
+pkill server
+```
+
+**chose the wrong aws region**
+us-east-1 is the default but ap-south-1 (mumbai) is the closest region to nepal. lower latency for your users — always check the region before launching.
