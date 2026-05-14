@@ -63,6 +63,17 @@ const notes = [
       },
     ],
   },
+  {
+    section: "Devops",
+    items: [
+      {
+        slug: "/devops",
+        tag: "devops",
+        title: "Devops notes",
+        desc: "CI/CD, infrastructure as code, monitoring, best practices",
+      },
+    ],
+  },
 ];
 
 export default function Home() {
