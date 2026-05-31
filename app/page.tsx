@@ -40,21 +40,14 @@ const notes = [
       },
     ],
   },
-
   {
-    section: "Linux / Tooling",
+    section: "Devops",
     items: [
       {
-        slug: "/linux/appimage-setup",
-        tag: "linux",
-        title: "AppImage setup on GNOME",
-        desc: "chmod, desktop files, no-sandbox",
-      },
-      {
-        slug: "/linux/bruno",
-        tag: "linux",
-        title: "Bruno for API testing",
-        desc: "postman alternative, git-friendly",
+        slug: "/devops",
+        tag: "devops",
+        title: "Devops notes",
+        desc: "CI/CD, infrastructure as code, monitoring, best practices",
       },
     ],
   },
