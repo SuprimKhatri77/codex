@@ -2,23 +2,6 @@ import Link from "next/link";
 
 const notes = [
   {
-    section: "Docker",
-    items: [
-      {
-        slug: "/docker/local-postgres",
-        tag: "docker",
-        title: "Local Postgres with Docker",
-        desc: "spin up, connect, migrate",
-      },
-      {
-        slug: "/docker/compose-setup",
-        tag: "docker",
-        title: "docker-compose basics",
-        desc: "define services, stop typing long cmds",
-      },
-    ],
-  },
-  {
     section: "Go / Gin",
     items: [
       {
@@ -36,19 +19,13 @@ const notes = [
     ],
   },
   {
-    section: "Linux / Tooling",
+    section: "Docker",
     items: [
       {
-        slug: "/linux/appimage-setup",
-        tag: "linux",
-        title: "AppImage setup on GNOME",
-        desc: "chmod, desktop files, no-sandbox",
-      },
-      {
-        slug: "/linux/bruno",
-        tag: "linux",
-        title: "Bruno for API testing",
-        desc: "postman alternative, git-friendly",
+        slug: "/docker",
+        tag: "docker",
+        title: "Docker notes",
+        desc: "containerization, orchestration, networking",
       },
     ],
   },

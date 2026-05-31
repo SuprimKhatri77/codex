@@ -1,0 +1,605 @@
+---
+title: docker fundamentals
+desc: core concepts, cli, dockerfiles, and compose — everything from scratch
+tag: docker
+---
+
+## what is docker and why bother
+
+the classic problem: _it works on my machine_. different os, different runtime versions, different
+library versions — getting an app to behave consistently across dev, staging, and prod is a pain.
+
+docker packages your app together with everything it needs (runtime, libraries, config) into a
+portable unit called a **container**. that container runs identically everywhere.
+
+- consistent environments across all machines
+- isolated processes — containers don't interfere with each other
+- lightweight compared to full vms (containers share the host os kernel)
+- easy to spin up, tear down, and scale
+
+---
+
+## core architecture
+
+docker uses a client-server model.
+
+```bash
+you (terminal)
+    │
+    ▼
+docker cli  ──── docker api ────►  docker daemon
+(client)                            (server)
+                                        │
+                               builds images, runs containers,
+                               manages networks & volumes
+```
+
+**docker engine** — the whole thing. bundles daemon + api + cli.
+
+**docker daemon (`dockerd`)** — long-running background process, the actual workhorse.
+
+- listens for docker api requests
+- builds images from dockerfiles
+- creates and manages containers
+- manages networks and volumes
+
+**docker cli** — what you type into. purely a control surface. sends commands to the daemon
+via the api, does zero execution itself.
+
+---
+
+## images vs containers
+
+these two terms get confused constantly. they're not the same thing.
+
+```bash
+image = class / blueprint / template   (read-only)
+container = running instance of that image
+```
+
+**docker image**
+
+- read-only template used to create containers
+- built from a dockerfile
+- made of **layers** — each dockerfile instruction adds a layer
+- layers are cached, so rebuilds are fast if nothing changed
+
+**docker container**
+
+- a running instance of an image
+- this is where your app actually executes
+- can be started, stopped, restarted, removed
+- ephemeral by default — delete a container and its data is gone
+
+two container types you'll deal with:
+
+- **stateless** — can be freely deleted and recreated. frontend, backend api, workers.
+- **stateful** — hold data that must survive restarts. databases (postgres, mongo). need volumes.
+
+---
+
+## other core concepts
+
+**volumes** — docker-managed persistent storage. data survives container deletion.
+
+```go
+container dies  →  container data dies  (bad for dbs)
+volume exists   →  volume data persists  ✓
+```
+
+**networks** — let containers talk to each other and external services. compose creates one
+automatically for you when you run `docker compose up`.
+
+**registry** — remote store for images. [docker hub](https://hub.docker.com) is the default public one.
+
+```bash
+# the basic registry workflow
+docker build -t myapp .         # build locally
+docker push myapp               # push to registry
+docker pull myapp               # pull from anywhere
+```
+
+---
+
+## the full lifecycle
+
+```bash
+dockerfile
+    │
+    │  docker build
+    ▼
+docker image
+    │
+    │  docker run
+    ▼
+running container
+    │
+    ├── docker logs      view output
+    ├── docker exec      run commands inside
+    ├── docker inspect   see full config/state
+    ├── docker stop      stop gracefully
+    ├── docker start     restart a stopped container
+    └── docker rm        delete the container
+```
+
+---
+
+## essential cli commands
+
+### images
+
+```bash
+# pull from docker hub
+docker pull nginx
+
+# list all local images
+docker images
+
+# remove an image
+docker rmi nginx
+
+# remove all unused images (cleanup)
+docker image prune
+```
+
+### containers
+
+```bash
+# run a container
+# -d         = detached, runs in background
+# --name     = friendly name
+# -p         = port mapping: host_port:container_port
+docker run -d --name my-nginx -p 8080:80 nginx
+
+# list running containers
+docker ps
+
+# list ALL containers (including stopped)
+docker ps -a
+
+# view logs
+docker logs my-nginx
+
+# follow logs in real-time
+docker logs -f my-nginx
+
+# stop a container
+docker stop my-nginx
+
+# start a stopped container
+docker start my-nginx
+
+# remove a container (must be stopped first)
+docker rm my-nginx
+
+# shell into a running container
+docker exec -it my-nginx bash
+
+# or sh for alpine-based images (no bash installed)
+docker exec -it my-nginx sh
+```
+
+> you must `docker stop` before `docker rm`. docker won't let you remove a running
+> container without the `-f` force flag.
+
+### what actually happens when you run `docker run hello-world`
+
+```bash
+docker run hello-world
+```
+
+1. cli sends a `run` request to the daemon
+2. daemon checks locally — no `hello-world` image found
+3. daemon pulls the image from docker hub automatically
+4. daemon creates a new container from that image
+5. container runs, prints its output
+6. daemon streams output back to the cli → your terminal
+
+---
+
+## writing a dockerfile
+
+a dockerfile is the recipe for building an image. each instruction adds a layer.
+
+```dockerfile
+FROM <base_image>        # start from an existing image
+WORKDIR /app             # set the working directory inside the container
+COPY <src> <dest>        # copy files from your machine into the image
+RUN <command>            # run a command at BUILD time (install packages, compile, etc)
+ARG <name>=<default>     # build-time variable (gone after image is built)
+ENV <name>=<value>       # env var available at build time AND runtime
+EXPOSE <port>            # document which port the app listens on (informational only)
+CMD ["cmd", "arg"]       # default command when a container starts
+```
+
+**timing matters:**
+
+| instruction | when it runs                               |
+| ----------- | ------------------------------------------ |
+| `RUN`       | at image build time                        |
+| `CMD`       | when container starts                      |
+| `ARG`       | build time only (not available at runtime) |
+| `ENV`       | build time + runtime                       |
+
+### layer caching trick
+
+this is important. copy `package.json` before copying your source code:
+
+```dockerfile
+# bad — every code change invalidates the cache and forces a full install
+COPY . .
+RUN bun install
+
+# good — install only re-runs when package.json actually changes
+COPY package*.json ./
+COPY bun.lock ./
+RUN bun install       # this layer gets CACHED if deps haven't changed
+COPY . .              # code changes only invalidate from here down
+```
+
+### a simple node/bun dockerfile
+
+```dockerfile
+FROM oven/bun:1-alpine
+
+WORKDIR /app
+
+COPY package*.json bun.lock ./
+RUN bun install
+
+COPY . .
+RUN bun run build
+
+EXPOSE 3000
+CMD ["bun", "start"]
+```
+
+### multi-stage builds (keeping images small)
+
+```dockerfile
+# stage 1: build
+FROM oven/bun:1-alpine AS builder
+WORKDIR /app
+COPY package*.json bun.lock ./
+RUN bun install
+COPY . .
+RUN bun run build
+
+# stage 2: production image (no dev deps, no build tools)
+FROM oven/bun:1-alpine AS runner
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/package.json ./
+RUN bun install --production
+EXPOSE 5000
+CMD ["bun", "start"]
+```
+
+the final image only contains what's needed to run — not the full build toolchain.
+can cut image size significantly.
+
+---
+
+## .dockerignore
+
+like `.gitignore` but for docker builds. prevents unnecessary or sensitive files from
+being sent to the daemon during build.
+
+```bash
+node_modules      # already installed inside the image — sending it wastes time
+dist              # build output, regenerated inside the image
+build
+.env              # never bake secrets into an image
+.git              # git history is useless inside a container
+npm-debug.log
+.next             # next.js build cache, regenerated inside
+```
+
+> always add `.env` to `.dockerignore`. if you ever push an image to a registry with
+> secrets baked in, those secrets are exposed to anyone who pulls it.
+
+---
+
+## real example: dockerizing express + next.js (with bun)
+
+project structure:
+
+```bash
+project/
+├── server/          express api
+│   ├── Dockerfile
+│   ├── .dockerignore
+│   └── index.ts
+└── client/          next.js frontend
+    ├── Dockerfile
+    ├── .dockerignore
+    └── app/
+```
+
+### server dockerfile
+
+```dockerfile
+FROM oven/bun:1-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY bun.lock ./
+
+RUN bun install
+
+COPY . .
+
+RUN bun run build
+
+EXPOSE 5000
+
+CMD ["bun", "start"]
+```
+
+### client dockerfile
+
+```dockerfile
+FROM oven/bun:1-alpine
+
+WORKDIR /app
+
+# ARG captures a value passed in at build time via --build-arg
+# default fallback if not provided
+ARG NEXT_PUBLIC_API_URL=http://localhost:5000
+
+# ENV makes it available at runtime too
+# next.js needs NEXT_PUBLIC_* vars at BUILD time — they get baked into the js bundle
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+
+# required by next.js on alpine
+RUN apk add --no-cache libc6-compat
+
+COPY package*.json bun.lock ./
+RUN bun install
+
+COPY . .
+RUN bun run build
+
+EXPOSE 3000
+
+CMD ["bun", "run", "start"]
+```
+
+**why `ARG` + `ENV` together?**
+
+`ARG` captures the value at build time. `ENV` makes it available at runtime.
+next.js `NEXT_PUBLIC_*` vars are embedded into the js bundle during `bun run build`,
+so they must exist at build time — just `ENV` alone isn't enough if you need to pass
+a different value per environment.
+
+### building and running manually
+
+```bash
+# build server image
+docker build -t api-server ./server
+
+# build client image, passing in the api url
+docker build --build-arg NEXT_PUBLIC_API_URL=http://localhost:5000 -t web-client ./client
+
+# run server
+docker run -d --name server -e PORT=5000 -p 5000:5000 api-server
+
+# run client
+docker run -d --name client -e PORT=3000 -p 3000:3000 web-client
+```
+
+this works but it's tedious and error-prone for multiple services. that's what compose is for.
+
+---
+
+## docker compose
+
+### why compose
+
+running multiple containers manually means:
+
+- building each image separately
+- running each container with the right flags
+- managing env vars manually
+- figuring out networking yourself
+- repeating all of this every time something changes
+
+compose lets you define your entire multi-container setup in one `docker-compose.yml` file.
+one command brings everything up.
+
+### the compose file, line by line
+
+```yaml
+services:
+  server:
+    build:
+      context: ./server # path to the directory containing the Dockerfile
+    environment:
+      PORT:
+        ${SERVER_PORT} # PORT = what express reads (process.env.PORT)
+        # SERVER_PORT = variable name in root .env file
+      DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - "${SERVER_PORT}:${SERVER_PORT}"
+
+  client:
+    build:
+      context: ./client
+      args:
+        NEXT_PUBLIC_API_URL: ${API_URL} # passed to ARG in the client Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: ${API_URL} # also set as runtime ENV
+    depends_on:
+      - server
+    ports:
+      - "${CLIENT_PORT}:${CLIENT_PORT}"
+```
+
+**`args` in client but not server** — `args` passes values to `ARG` instructions in the
+dockerfile. the client dockerfile has `ARG NEXT_PUBLIC_API_URL` because next.js needs it
+at build time to bake it into the bundle. the server has no `ARG` instructions — it reads
+env vars at runtime — so no `args` needed there.
+
+**`depends_on: - server`** — without this, compose starts all services simultaneously.
+with it, compose waits for the server container to start before starting the client.
+prevents the client from trying to reach an api that isn't up yet.
+
+> note: `depends_on` waits for the container to _start_, not for the app to be _ready_.
+> for production, you'd add health checks to wait for the service to actually be healthy.
+
+**`.env` auto-loading** — compose automatically reads a `.env` file in the same directory
+as `docker-compose.yml`. variables defined there are substituted anywhere you write
+`${VARIABLE_NAME}` in the compose file.
+
+```bash
+# root .env
+SERVER_PORT=5000
+CLIENT_PORT=3000
+API_URL=http://server:5000
+DATABASE_URL=postgresql://user:pass@db:5432/mydb
+```
+
+### how containers discover each other
+
+this is one of the most important things compose does automatically.
+
+when you run `docker compose up`, compose creates a **shared network** and attaches
+all services to it. on that network, each container is reachable by its **service name**
+as a hostname.
+
+```bash
+# inside the client container, calling the server:
+http://server:5000      ← correct, uses service name
+
+# NOT this:
+http://localhost:5000   ← wrong — localhost inside client = the client container itself
+```
+
+```bash
+┌─────────────────────────────────────────────┐
+│           docker_default network             │
+│                                             │
+│   ┌──────────────┐     ┌──────────────┐    │
+│   │   client     │────►│   server     │    │
+│   │ (next.js)    │     │ (express)    │    │
+│   └──────────────┘     └──────────────┘    │
+│   reachable as          reachable as        │
+│   "client"              "server"            │
+└─────────────────────────────────────────────┘
+```
+
+so in your `.env`, `API_URL` should be `http://server:5000` when running via compose —
+not `http://localhost:5000`.
+
+### running compose
+
+```bash
+# build all images and start all services in the background
+docker compose up -d --build
+
+# --build  → rebuild images even if they already exist (picks up code changes)
+# -d       → detached: runs in background so your terminal isn't locked
+#            without -d, compose streams all logs to your terminal and ctrl+c stops everything
+
+# stop and remove containers (keeps volumes and images)
+docker compose down
+
+# stop + remove containers AND wipe volumes (destroys persistent data)
+docker compose down -v
+
+# rebuild a single service without touching others
+docker compose up -d --build server
+```
+
+### logs
+
+```bash
+# all services
+docker compose logs
+
+# specific service
+docker compose logs server
+docker compose logs client
+
+# follow in real-time
+docker compose logs -f
+
+# follow a specific service
+docker compose logs -f client
+```
+
+### compose with a database
+
+```yaml
+services:
+  db:
+    image: postgres:16-alpine # use the official image, no custom dockerfile needed
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # persist db data across container restarts
+    ports:
+      - "5432:5432"
+
+  server:
+    build:
+      context: ./server
+    environment:
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/${DB_NAME}
+      # note: "db" here is the service name — container discovery in action
+    depends_on:
+      - db
+    ports:
+      - "5000:5000"
+
+  client:
+    build:
+      context: ./client
+      args:
+        NEXT_PUBLIC_API_URL: http://server:5000
+    depends_on:
+      - server
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data: # named volume — docker manages this, data persists across compose down
+```
+
+> the `volumes:` block at the bottom declares the named volume. without it, the volume
+> reference in the service would fail.
+
+---
+
+## quick reference
+
+```bash
+# images
+docker pull <image>                          # pull from docker hub
+docker images                                # list local images
+docker build -t <name> <path>               # build an image
+docker rmi <image>                          # remove an image
+docker image prune                          # remove unused images
+
+# containers
+docker run -d --name <n> -p <h>:<c> <img>  # run a container
+docker ps                                   # list running containers
+docker ps -a                                # list all containers
+docker logs <name>                          # view logs
+docker logs -f <name>                       # follow logs
+docker stop <name>                          # stop
+docker start <name>                         # start
+docker rm <name>                            # remove (must be stopped)
+docker exec -it <name> sh                  # shell into container
+
+# compose
+docker compose up -d --build               # build + start all services
+docker compose down                        # stop + remove containers
+docker compose down -v                     # also wipe volumes
+docker compose logs -f                     # follow all logs
+docker compose logs -f <service>           # follow specific service
+docker compose up -d --build <service>     # rebuild one service only
+```
