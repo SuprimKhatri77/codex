@@ -2,23 +2,6 @@ import Link from "next/link";
 
 const notes = [
   {
-    section: "Docker",
-    items: [
-      {
-        slug: "/docker/local-postgres",
-        tag: "docker",
-        title: "Local Postgres with Docker",
-        desc: "spin up, connect, migrate",
-      },
-      {
-        slug: "/docker/compose-setup",
-        tag: "docker",
-        title: "docker-compose basics",
-        desc: "define services, stop typing long cmds",
-      },
-    ],
-  },
-  {
     section: "Go / Gin",
     items: [
       {
@@ -36,6 +19,29 @@ const notes = [
     ],
   },
   {
+    section: "Docker",
+    items: [
+      {
+        slug: "/docker",
+        tag: "docker",
+        title: "Docker notes",
+        desc: "containerization, orchestration, networking",
+      },
+    ],
+  },
+  {
+    section: "Git",
+    items: [
+      {
+        slug: "/git",
+        tag: "git",
+        title: "Git commands",
+        desc: "branching, remotes, undoing things, pr strategies",
+      },
+    ],
+  },
+
+  {
     section: "Linux / Tooling",
     items: [
       {
@@ -49,17 +55,6 @@ const notes = [
         tag: "linux",
         title: "Bruno for API testing",
         desc: "postman alternative, git-friendly",
-      },
-    ],
-  },
-  {
-    section: "Git",
-    items: [
-      {
-        slug: "/git",
-        tag: "git",
-        title: "Git commands",
-        desc: "branching, remotes, undoing things, pr strategies",
       },
     ],
   },
