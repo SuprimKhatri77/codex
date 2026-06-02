@@ -1,0 +1,434 @@
+---
+title: docker local dev setup
+desc: dockerizing a turborepo monorepo for local development with hot reload — go/gin + next.js + postgres
+tag: docker
+---
+
+## what even is docker
+
+you're running someone else's machine to run your code. that's it.
+
+when you ssh'd into ec2, installed go, cloned your repo, and ran the binary — docker automates that exact sequence. instead of typing commands manually, you write them in a `dockerfile` and docker executes them every time, identically, on any machine.
+
+```bash
+your ec2 setup:          dockerfile equivalent:
+ssh into server    →     FROM golang:1.26.1-alpine
+apt install go     →     (already in the image)
+go install air     →     RUN go install github.com/air-verse/air@latest
+git clone repo     →     COPY . .
+./main             →     CMD ["air"]
+```
+
+## when to use docker
+
+```bash
+local dev     → turbo dev (hot reload, fast, native)
+local db      → docker compose with just the db service  ← best use case
+prod deploy   → full multistage dockerfile build → ec2/render/railway
+```
+
+the killer local use case is running postgres (or redis, etc.) without installing anything on your machine. just `docker compose up db` and you're done. data persists across restarts.
+
+for team projects, docker also ensures everyone runs the same go/bun/node version regardless of what's on their machine — no "works on my machine."
+
+## dockerfile anatomy
+
+using the go dev dockerfile as an example:
+
+```dockerfile
+FROM golang:1.26.1-alpine
+
+WORKDIR /app
+
+RUN go install github.com/air-verse/air@latest
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+EXPOSE 8080
+
+CMD ["air"]
+```
+
+**FROM** — pulls an image from docker hub (the default public registry). `golang:1.26.1-alpine` is `image:tag` format. this is the base "machine" you're building on top of.
+
+**alpine** — a minimal linux distro (~5mb vs ubuntu's ~80mb). standard choice for docker images to keep things small. you'll see it everywhere.
+
+**WORKDIR** — sets the working directory inside the container. every command after it runs from there. equivalent to `mkdir /app && cd /app`. without it, commands run from `/` (filesystem root).
+
+**RUN** — executes a shell command during the image build. for installing tools, running scripts — anything you'd do in a terminal to set up the environment. `apk` is alpine's package manager (like `apt` on ubuntu).
+
+**first COPY + go mod download** — this is a caching trick. docker caches each layer. by copying only `go.mod`/`go.sum` first and running `go mod download`, if your source code changes but dependencies didn't, docker reuses the cached download layer. `go mod download` fetches deps; `go mod tidy` is for cleaning unused ones — different things.
+
+**COPY . .** — `COPY <source> <destination>`. source is from your build context (folder on your machine), destination is inside the container. first `.` = your machine, second `.` = container's workdir. comes after the deps install so code changes don't bust the cache.
+
+**EXPOSE** — documents which port the container listens on. mostly informational — actual port mapping happens in compose with `ports:`.
+
+**CMD** — the command that runs when the container starts. unlike `RUN` (build time), `CMD` is runtime. array format `["air"]` is preferred because it doesn't spawn a shell to parse the command. spaces are fine: `["bun", "run", "dev"]` — each argument is a separate string.
+
+**CMD for multiple things** — if you need to run migrations before starting:
+
+```dockerfile
+CMD ["sh", "-c", "migrate-command && air"]
+```
+
+## version pinning
+
+```dockerfile
+FROM golang:1.26.1-alpine   # pinned — always this exact version
+FROM oven/bun:1-alpine       # floating — latest 1.x release
+FROM oven/bun:1.3.14-alpine  # pinned bun
+```
+
+for prod, pin everything. for local dev, floating `1-alpine` is fine. docker hub is where official images live — `golang`, `postgres`, `oven/bun` are all official images there.
+
+## installing packages vs tools
+
+```sh
+# packages (libraries you import) — do this on your host machine as normal
+go get github.com/google/uuid        # updates go.mod + go.sum
+bun add nanoid                        # updates package.json + bun.lock
+```
+
+after adding a package, the lockfiles on your machine are updated. since those files are bind mounted into the container (more on that below), you need to rebuild once so docker runs `go mod download` / `bun install` with the new deps:
+
+```sh
+docker compose -f docker-compose.dev.yml up --build
+```
+
+```dockerfile
+# tools (cli tools used during dev/build) — define in dockerfile
+RUN go install github.com/air-verse/air@latest
+RUN go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
+```
+
+- **packages** (uuid, pgx, nanoid) → `go get` / `bun add` on host, docker picks up via lockfiles
+- **tools** (air, sqlc, golang-migrate) → `RUN go install ...` in dockerfile, baked into the image
+
+## volumes — bind mounts vs persistent storage
+
+volumes do two very different things depending on syntax:
+
+**bind mount** — syncs a folder from your machine into the container:
+
+```yaml
+volumes:
+  - ./apps/api:/app # your local apps/api IS /app inside container
+```
+
+this is what enables hot reload. air watches `/app` inside the container. since it maps to your actual local folder, any file save on your machine is instantly visible inside the container.
+
+**anonymous volume** — keeps a specific directory isolated inside the container, not synced from your machine:
+
+```yaml
+volumes:
+  - ./apps/api:/app # sync everything from local to container
+  - /app/tmp # except this dir — keep container's version
+```
+
+`/app/tmp` is where air writes compiled binaries. you don't want those written to your local machine. the anonymous volume "punches a hole" in the bind mount — docker keeps that directory inside the container only.
+
+same pattern for node_modules and next.js cache in the web service:
+
+```yaml
+volumes:
+  - ./apps/web:/app/apps/web # sync source code
+  - /app/apps/web/node_modules # keep container's node_modules (different arch/binaries)
+  - /app/apps/web/.next # keep container's build cache
+```
+
+your local `node_modules` (if it exists) was installed for your host machine's architecture. the container's was installed on alpine linux — different binary formats. the anonymous volume says "don't let the host's node_modules overwrite the container's."
+
+**named volume** — for persistent data (databases). survives container removal:
+
+```yaml
+volumes:
+  - pgdata:/var/lib/postgresql/data   # named volume, data persists
+
+volumes:         # declare it at the bottom
+  pgdata:
+```
+
+without this, your postgres data resets every time the container restarts.
+
+## networks
+
+by default containers are isolated — they can't reach each other's ports at all. `app-network` puts both services on the same virtual network so they can find each other by service name:
+
+```yaml
+networks:
+  app-network:
+    driver: bridge
+```
+
+inside compose, services talk by service name: `http://api:8080`, not `http://localhost:8080`. localhost inside the web container refers to the web container itself, not the api container.
+
+**driver: bridge** — creates a private internal network between containers on the same host. other options exist:
+
+- `host` — container shares your machine's network directly, no isolation
+- `overlay` — spans across multiple machines (docker swarm/kubernetes)
+- `none` — completely isolated, no network
+
+bridge is what you want 99% of the time.
+
+networks are not cors. cors is the browser blocking http requests. this is lower level — actual network isolation between processes on different containers. cors still applies separately if your browser is hitting the api directly.
+
+## build context
+
+```yaml
+services:
+  api:
+    build:
+      context: ./apps/api # this folder becomes the "." in COPY . .
+      dockerfile: Dockerfile.dev
+  web:
+    build:
+      context: . # monorepo root — needed because bun.lock is here
+      dockerfile: ./apps/web/Dockerfile.dev
+```
+
+the `context` is what docker sees as the filesystem when building. if `bun.lock` is at the monorepo root, context must be `.` (root). if all your source is self-contained in `apps/api`, context can be `./apps/api`.
+
+## naming containers and projects
+
+by default compose names things `<foldername>-<service>-1`. the `-1` exists because compose supports scaling (`--scale api=3` = three api containers for load testing).
+
+```yaml
+name: myproject # compose project name (the group in docker dashboard)
+
+services:
+  api:
+    container_name: myproject-api # renames api-1 to myproject-api
+  web:
+    container_name: myproject-web
+```
+
+if you set `container_name`, you lose the ability to scale that service (two containers can't share a name). fine for local dev.
+
+volumes are scoped to the project name — `myproject_pgdata` not `pgdata`. so two projects with `pgdata:` in their compose files don't conflict. if no `name:` is set, docker uses the folder name automatically.
+
+verify with:
+
+```sh
+docker volume ls
+# myproject_pgdata
+# otherapp_pgdata
+```
+
+## local postgres setup
+
+add to `docker-compose.dev.yml`:
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: myproject-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+volumes:
+  pgdata:
+```
+
+your api's `.env` then points to `db` as the host:
+
+```bash
+DATABASE_URL=postgres://postgres:postgres@db:5432/mydb?sslmode=disable
+```
+
+`@db:5432` not `@localhost:5432` — `db` is the service name on the compose network.
+
+references vs declarations — volumes and networks both follow the same pattern.
+inside a service you're referencing, at the bottom you're declaring:
+
+```yaml
+services:
+  db:
+    volumes:
+      - pgdata:/var/lib/postgresql/data # reference — "use the volume called pgdata here"
+
+volumes:
+  pgdata: # declaration — "create and manage this named volume"
+```
+
+without the declaration at the bottom, docker errors saying it doesn't know what `pgdata` is.
+same applies to networks — referencing `app-network` under each service and declaring it under `networks:` are two separate things.
+
+## full dev setup (turborepo — go/gin + next.js)
+
+**apps/api/Dockerfile.dev**
+
+```dockerfile
+FROM golang:1.26.1-alpine
+
+WORKDIR /app
+
+RUN go install github.com/air-verse/air@latest
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+EXPOSE 8080
+
+CMD ["air"]
+```
+
+**apps/web/Dockerfile.dev**
+
+```dockerfile
+FROM oven/bun:1-alpine
+
+WORKDIR /app
+
+RUN apk add --no-cache libc6-compat
+
+COPY bun.lock package.json turbo.json ./
+COPY apps/web/package.json ./apps/web/
+COPY packages/ ./packages/
+RUN bun install --frozen-lockfile
+
+EXPOSE 3000
+
+CMD ["bun", "run", "dev", "--filter=web"]
+```
+
+`--filter=web` tells turbo to only run the web app's dev script. without it turbo sees the monorepo root and tries to run dev for all packages including api — which conflicts with the api container already running on 8080.
+
+`--frozen-lockfile` — bun must install exactly what's in `bun.lock`, error if anything would change it. ensures everyone building the image gets the same packages. same reason you'd use `npm ci` over `npm install`.
+
+**docker-compose.dev.yml**
+
+```yaml
+name: myproject
+
+services:
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile.dev
+    container_name: myproject-api
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./apps/api/.env
+    volumes:
+      - ./apps/api:/app
+      - /app/tmp
+    networks:
+      - app-network
+
+  web:
+    build:
+      context: .
+      dockerfile: ./apps/web/Dockerfile.dev
+    container_name: myproject-web
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./apps/web/.env
+    volumes:
+      - ./apps/web:/app/apps/web
+      - ./packages:/app/packages
+      - /app/apps/web/node_modules
+      - /app/apps/web/.next
+    networks:
+      - app-network
+
+  db:
+    image: postgres:17-alpine
+    container_name: myproject-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: mydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+```
+
+## .dockerignore
+
+with `context: .` (monorepo root), place this at the repo root:
+
+```bash
+apps/web/.next/
+apps/web/node_modules/
+apps/api/tmp/
+apps/api/*.exe
+node_modules/
+.git/
+**/.env*
+**/README.md
+```
+
+reduces build context size — docker doesn't send unnecessary files when building.
+
+## useful commands
+
+```sh
+# start dev environment
+docker compose -f docker-compose.dev.yml up
+
+# start and rebuild images (after adding a new package)
+docker compose -f docker-compose.dev.yml up --build
+
+# run in background
+docker compose -f docker-compose.dev.yml up -d
+
+# stop everything
+docker compose -f docker-compose.dev.yml down
+
+# stop and remove volumes (resets db data)
+docker compose -f docker-compose.dev.yml down -v
+
+# view logs for a specific service
+docker compose -f docker-compose.dev.yml logs -f api
+
+# shell into a running container
+docker exec -it myproject-api sh
+
+# list running containers
+docker ps
+
+# list all volumes
+docker volume ls
+
+# remove a specific volume
+docker volume rm myproject_pgdata
+
+# rebuild a single service
+docker compose -f docker-compose.dev.yml up --build web
+```
+
+`-f <filename>` — specifies which compose file to use. default is `docker-compose.yml`. `-d` is detached (background). `-f` on `docker logs` is a different command — that one follows live log output.
+
+## each time you open your laptop
+
+```sh
+docker compose -f docker-compose.dev.yml up
+```
+
+images don't rebuild from scratch. docker caches layers — it just starts the containers. only rebuilds if you change a dockerfile or pass `--build`.
