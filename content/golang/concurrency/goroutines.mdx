@@ -1,0 +1,235 @@
+---
+title: goroutines and concurrency
+desc: lightweight concurrent functions managed by the go runtime, not the os
+tag: go
+---
+
+goroutines are go's answer to concurrency. not threads, not callbacks, not promises — just functions that run at the same time with almost no overhead.
+
+---
+
+## what is a goroutine
+
+a goroutine is a function running concurrently with other goroutines in the same process. the go runtime manages scheduling — you never touch OS threads directly.
+
+each goroutine costs around 2-8kb of stack memory to start (vs ~1mb for an OS thread). you can have thousands without issues.
+
+```go
+go fmt.Println("runs concurrently")
+
+go func() {
+  fmt.Println("anonymous goroutine")
+}()
+```
+
+just put `go` in front of any function call. that's it.
+
+---
+
+## the fire and forget problem
+
+goroutines don't return values and main doesn't wait for them. if main exits, every goroutine gets killed immediately — no cleanup, no warning.
+
+```go
+go func() {
+  time.Sleep(2 * time.Second)
+  fmt.Println("this might never print")
+}()
+
+// main exits here, goroutine is killed
+```
+
+the naive fix is `time.Sleep` in main — but you're guessing how long goroutines take. fragile in production. real fix is `sync.WaitGroup`.
+
+---
+
+## time.Sleep units
+
+common mistake. `time.Sleep` takes a `time.Duration` which is nanoseconds under the hood.
+
+```go
+time.Sleep(300)                          // 300 nanoseconds — basically nothing
+time.Sleep(300 * time.Millisecond)       // 300ms
+time.Sleep(time.Second)                  // 1s
+time.Sleep(2 * time.Second)              // 2s
+time.Sleep(time.Second + 500*time.Millisecond) // 1.5s
+```
+
+---
+
+## measuring elapsed time
+
+```go
+start := time.Now()
+
+// ... do work ...
+
+fmt.Println("took:", time.Since(start))
+```
+
+---
+
+## race conditions
+
+when multiple goroutines read and write the same variable, results are non-deterministic. you'll get different values every run, with no panic or error — just silently wrong data.
+
+```go
+counter := 0
+
+for range 100 {
+  go func() {
+    counter++ // not safe
+  }()
+}
+
+// counter will likely not be 100
+```
+
+`counter++` is three operations: read, increment, write. another goroutine can interrupt between any of them and overwrite your result.
+
+detect races with: `go run -race main.go`
+
+fix: `sync.Mutex` or channels.
+
+---
+
+## closure bug in goroutine loops
+
+classic gotcha. goroutines capture a reference to the loop variable, not the value at launch time.
+
+```go
+// buggy — all goroutines may print the same value of i
+for i := range 5 {
+  go func() {
+    fmt.Println(i)
+  }()
+}
+
+// fixed — pass i as argument, each goroutine gets its own copy
+for i := range 5 {
+  go func(i int) {
+    fmt.Println(i)
+  }(i)
+}
+```
+
+go 1.22+ fixes this for range loops but the explicit argument pattern is still clearest.
+
+---
+
+## sequential vs concurrent
+
+the real value of goroutines for backend work:
+
+```go
+// sequential — total time = sum of all calls
+fetchUser()     // 3s
+fetchOrders()   // 2s
+fetchProducts() // 4s
+// total: 9s
+
+// concurrent — total time = slowest call
+var wg sync.WaitGroup
+wg.Add(3)
+
+go func() { defer wg.Done(); fetchUser() }()
+go func() { defer wg.Done(); fetchOrders() }()
+go func() { defer wg.Done(); fetchProducts() }()
+
+wg.Wait()
+// total: 4s
+```
+
+n independent operations that each take t seconds:
+
+- sequential: n \* t
+- concurrent: max(t1, t2, ..., tn)
+
+---
+
+## worker pool basics
+
+instead of launching one goroutine per job (could be thousands), launch a fixed pool and distribute work.
+
+```go
+jobs := []int{1, 2, 3, 4, 5, 6, 7, 8, 9}
+var wg sync.WaitGroup
+
+chunks := [][]int{jobs[0:3], jobs[3:6], jobs[6:9]}
+
+for workerID, chunk := range chunks {
+  wg.Add(1)
+  go func(id int, jobs []int) {
+    defer wg.Done()
+    for _, job := range jobs {
+      fmt.Printf("worker %d processing job %d\n", id+1, job)
+    }
+  }(workerID, chunk)
+}
+
+wg.Wait()
+```
+
+the dynamic version (workers pulling from a job queue) uses channels.
+
+why not just launch 1000 goroutines for 1000 jobs? memory. 1000 goroutines at 8kb each is ~8mb just for stacks. the go scheduler also has to track all 1000 even if they're idle. fixed workers = same throughput, fraction of overhead.
+
+---
+
+## goroutine lifecycle
+
+goroutines live and die with the main goroutine (the process). main exits, everything stops.
+
+```go
+go func() {
+  for {
+    fmt.Println("running...")
+    time.Sleep(500 * time.Millisecond)
+    // killed mid-loop when main exits
+  }
+}()
+
+time.Sleep(2 * time.Second)
+fmt.Println("main done — goroutine above is dead")
+```
+
+for goroutines that need graceful shutdown, use `context.WithTimeout` or `context.WithCancel` and check `ctx.Done()` inside the loop.
+
+---
+
+## common real-world patterns
+
+background job after response — user doesn't wait for side effects:
+
+```go
+func handleSignup(w http.ResponseWriter, r *http.Request) {
+  user := createUser(r)
+  w.WriteHeader(http.StatusCreated)
+
+  go func() {
+    sendWelcomeEmail(user)
+    notifySlack(user)
+  }()
+}
+```
+
+parallel service calls:
+
+```go
+var wg sync.WaitGroup
+wg.Add(3)
+
+go func() { defer wg.Done(); getUserData(id) }()
+go func() { defer wg.Done(); getUserOrders(id) }()
+go func() { defer wg.Done(); getNotifications(id) }()
+
+wg.Wait()
+```
+
+other use cases: health checks across multiple services, cache warming on startup, processing uploaded files, websocket connections (one goroutine per client), audit logging without blocking the request.
+
+---
+
+## what's next
+
+goroutines alone can't communicate results back — they're fire and forget. to actually get data out of a goroutine you need channels, and to coordinate multiple goroutines properly you need waitgroups and mutexes.
