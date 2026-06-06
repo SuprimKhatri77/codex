@@ -1,0 +1,425 @@
+---
+title: multi-stage builds
+desc: separate build env from runtime env — smaller images, cleaner containers, production-ready setup
+tag: docker
+---
+
+## why multi-stage builds
+
+when you build a typescript app, you need a compiler, dev dependencies, build tools — stuff that
+has zero business being in your final running container. you only need the compiled output to run.
+
+single-stage problem:
+
+```dockerfile
+# single stage — everything ends up in the image
+FROM oven/bun:1-alpine
+RUN bun install          # installs devDependencies too
+RUN bun run build        # compiles ts
+# now your image has: source code, dev deps, build tools, compiled output
+# bloated, slower to pull, larger attack surface
+```
+
+multi-stage fix: use multiple `FROM` statements. docker only ships the **final stage**.
+everything from earlier stages gets discarded unless you explicitly copy it over.
+
+```bash
+stage 1 (builder)    →    compile everything
+                               │
+                          COPY --from=builder
+                               │
+                               ▼
+stage 2 (runtime)    →    only what's needed to run
+                          no source code, no dev deps, no compiler
+```
+
+real impact — a typical ts/bun api can go from ~400mb → ~80mb.
+
+---
+
+## multi-stage server dockerfile (express + bun)
+
+```dockerfile
+# ── stage 1: builder ──────────────────────────────────────────────
+FROM oven/bun:1-alpine AS builder
+# AS builder gives this stage a name so we can reference it later
+
+WORKDIR /app
+
+COPY package*.json ./
+COPY bun.lock ./
+
+RUN bun install
+# installs ALL dependencies including devDependencies
+# needed here because we need typescript, type definitions, etc. to compile
+
+COPY . .
+
+RUN bun run build
+# compiles typescript → outputs javascript to /app/dist
+# this is the only thing we actually need at runtime
+
+
+# ── stage 2: runtime ──────────────────────────────────────────────
+FROM oven/bun:1-alpine AS runtime
+# fresh image — nothing from builder carries over automatically
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN bun install --omit=dev
+# --omit=dev = skip devDependencies
+# only install what the app needs to actually run (express, pg, etc.)
+# NOT typescript, ts-node, @types/*, testing libs, etc.
+
+COPY --from=builder /app/dist ./dist
+# copy ONLY the compiled output from the builder stage
+# not the source code, not node_modules from builder
+# just the /app/dist folder → into /app/dist in this stage
+
+EXPOSE 5000
+
+CMD ["bun", "dist/index.js"]
+# run the compiled js directly, no typescript involved at runtime
+```
+
+what makes it into the final image:
+
+- `dist/` — compiled js output
+- `node_modules/` — runtime deps only (no dev deps)
+- `package.json`
+
+what gets left behind (in the discarded builder stage):
+
+- all source `.ts` files
+- `devDependencies` (typescript, types, etc.)
+- the bun compiler cache
+
+---
+
+## multi-stage client dockerfile (next.js → nginx)
+
+this one is more interesting. the builder stage uses bun/next.js to compile the app,
+but the runtime stage switches to **nginx** — a completely different base image — to serve it.
+
+```dockerfile
+# ── stage 1: builder ──────────────────────────────────────────────
+FROM oven/bun:1-alpine AS builder
+
+WORKDIR /app
+
+ARG NEXT_PUBLIC_API_URL=http://localhost:5000
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# ARG = build-time variable passed in via docker compose args:
+# ENV = makes it available at runtime AND bakes it into the next.js bundle
+# next.js NEXT_PUBLIC_* vars get embedded into the compiled js at build time
+# so they MUST exist before RUN bun run build
+
+RUN apk add --no-cache libc6-compat
+# required by next.js on alpine linux
+
+COPY package*.json bun.lock ./
+RUN bun install
+
+COPY . .
+RUN bun run build
+# next.js compiles → static html/css/js output goes to /app/out
+# (requires output: 'export' in next.config.ts for static export)
+
+
+# ── stage 2: runtime ──────────────────────────────────────────────
+FROM nginx:alpine
+# completely different base image — nginx is a lightweight web server
+# NO bun, NO node, NO next.js in the final image at all
+# just nginx serving static files
+
+COPY nginx/default.conf /etc/nginx/conf.d/default.conf
+# our custom nginx config — controls how nginx handles requests
+# replaces the default nginx config
+
+COPY --from=builder /app/out /usr/share/nginx/html
+# copy the compiled static output from the builder stage
+# /usr/share/nginx/html is where nginx serves files from by default
+
+EXPOSE 80
+# nginx serves on port 80 by default
+
+CMD ["nginx", "-g", "daemon off;"]
+# start nginx in the foreground (daemon off = don't background the process)
+# docker needs a foreground process to keep the container alive
+```
+
+the final image is just nginx + your compiled static files. tiny.
+
+---
+
+## the nginx config explained
+
+```nginx
+# client/nginx/default.conf
+
+server {
+    listen 80;
+    # nginx listens on port 80 inside the container
+
+    server_name _;
+    # _ = match any hostname. works for localhost, ip address, domain — anything.
+
+    root /usr/share/nginx/html;
+    # where nginx looks for files to serve
+    # this is where we copied /app/out into
+
+    index index.html;
+    # default file to serve when hitting a directory
+
+    # ── serving the next.js app ──
+    location / {
+        try_files $uri /index.html;
+        # try_files checks in order:
+        # 1. does a file matching $uri exist? serve it directly (css, js, images)
+        # 2. if not, fall back to index.html
+        #
+        # this is what makes client-side routing work.
+        # if someone hits /dashboard directly, there's no dashboard.html file —
+        # nginx falls back to index.html and next.js router takes over from there.
+    }
+
+    # ── proxying api requests to the backend ──
+    location /api/ {
+        proxy_pass http://server:5000;
+        # any request starting with /api/ gets forwarded to the server container
+        # "server" here is the docker compose SERVICE NAME — not localhost, not an ip
+        # docker's internal network resolves "server" to the server container's ip
+        # automatically. this is container service discovery.
+
+        proxy_http_version 1.1;
+        # use http/1.1 for the proxied connection (supports keep-alive)
+
+        proxy_set_header Host $host;
+        # pass the original Host header to the backend
+        # so your express app sees the real hostname, not nginx's internal one
+
+        proxy_set_header X-Real-IP $remote_addr;
+        # pass the actual client ip to the backend
+        # without this, express would see nginx's ip as the client
+
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # standard header to track the full chain of proxies the request went through
+
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # tells the backend whether the original request was http or https
+    }
+}
+```
+
+**what nginx is doing here:**
+
+```bash
+browser
+   │
+   │  GET /dashboard        → nginx serves index.html → next.js router handles it
+   │  GET /api/users        → nginx proxies to http://server:5000/api/users
+   │  GET /static/main.js   → nginx serves the file directly from disk
+   ▼
+nginx (port 80)
+   │
+   ├── static files → /usr/share/nginx/html
+   └── /api/* → proxy_pass → server:5000
+```
+
+nginx sits in front as a reverse proxy. it handles static file serving (which it's extremely
+good at) and routes any `/api/*` request to your backend. your backend never gets hit directly
+from the outside.
+
+---
+
+## why `server` instead of `localhost` in nginx config
+
+this is one of the most confusing things when starting with docker.
+
+```nginx
+proxy_pass http://server:5000;    ← correct
+proxy_pass http://localhost:5000; ← wrong, will fail
+```
+
+inside the nginx container, `localhost` refers to **the nginx container itself** — not your
+express server. the express server is a completely separate container.
+
+when you run `docker compose up`, compose creates a **shared network** and connects all
+services to it. on that network, each container is reachable by its **service name** as a hostname.
+
+```yaml
+services:
+  server: # ← this name becomes a hostname on the docker network
+    build: ./server
+
+  client: # ← this name becomes a hostname on the docker network
+    build: ./client
+```
+
+docker's internal dns automatically resolves `server` → the ip of the server container.
+
+```bash
+docker_default network
+┌────────────────────────────────────────────────┐
+│                                                │
+│  ┌──────────────┐        ┌──────────────────┐ │
+│  │    client    │──────► │     server       │ │
+│  │  (nginx)     │        │  (express:5000)  │ │
+│  └──────────────┘        └──────────────────┘ │
+│                                                │
+│  client resolves "server" via docker dns       │
+│  → gets server container's internal ip         │
+└────────────────────────────────────────────────┘
+```
+
+this applies everywhere inside containers:
+
+- nginx config: `proxy_pass http://server:5000`
+- backend connecting to db: `DATABASE_URL=postgresql://user:pass@db:5432/mydb`
+- service name = hostname, always.
+
+---
+
+## the docker compose file explained
+
+```yaml
+services:
+  server:
+    build:
+      context: ./server # build the image using Dockerfile in ./server
+    restart: unless-stopped
+    # restart policy — what happens if the container crashes or the host reboots:
+    #   no             = never restart (default)
+    #   always         = always restart
+    #   unless-stopped = restart unless you manually stopped it  ← sensible default
+    #   on-failure     = only restart on non-zero exit code
+    environment:
+      PORT: ${SERVER_PORT}
+      DATABASE_URL: ${DATABASE_URL}
+    ports:
+      - "${SERVER_PORT}:${SERVER_PORT}"
+      # host_port:container_port
+      # exposes the server to your machine at localhost:SERVER_PORT
+
+  client:
+    build:
+      context: ./client
+      args:
+        NEXT_PUBLIC_API_URL: /api/
+        # passed to ARG in the client Dockerfile at build time
+        # value is /api/ — not http://server:5000
+        # because from the BROWSER's perspective, /api/ is a relative path
+        # the browser hits nginx at /api/users → nginx proxies to server:5000
+        # the browser never talks to server:5000 directly
+    restart: unless-stopped
+    depends_on:
+      - server
+      # wait for server container to start before starting client
+      # prevents client from starting when backend isn't ready yet
+    ports:
+      - "${CLIENT_PORT}:80"
+      # CLIENT_PORT (from .env) on your host  →  port 80 inside the container
+      # nginx inside the container always listens on 80
+      # CLIENT_PORT controls what port YOU access it on from your machine
+```
+
+**the port mapping and how `CLIENT_PORT:80` works:**
+
+```bash
+# if CLIENT_PORT=80 in .env:
+ports: - "80:80"
+# access at http://localhost  (no port needed — 80 is the default http port)
+
+# if CLIENT_PORT=3000 in .env:
+ports: - "3000:80"
+# access at http://localhost:3000
+# nginx inside still runs on :80, you just reach it through :3000 on your machine
+```
+
+the container's internal port is always 80 (nginx). the left side of the mapping is
+just what port you expose it on from your host machine.
+
+**why `NEXT_PUBLIC_API_URL: /api/` in compose args instead of `http://server:5000`?**
+
+```bash
+# wrong mental model:
+browser → http://server:5000/api/users   ← browser can't resolve "server", that's docker-internal
+
+# correct model:
+browser → http://localhost/api/users
+              │
+              ▼
+          nginx (client container)
+              │  location /api/ matches
+              │  proxy_pass http://server:5000
+              ▼
+          express (server container)
+```
+
+`/api/` is a relative path. when next.js calls `/api/users`, it goes to the same host
+the browser is on (your nginx). nginx then proxies it to `server:5000`. the browser
+never needs to know `server:5000` exists.
+
+---
+
+## root .env
+
+```bash
+SERVER_PORT=5000
+CLIENT_PORT=80
+DATABASE_URL=postgresql://user:pass@db:5432/mydb
+```
+
+compose reads this automatically. substitute anywhere you use `${VARIABLE}` in the compose file.
+
+---
+
+## running it
+
+```bash
+# build both images (multi-stage) and start everything
+docker compose up -d --build
+
+# check image sizes — see the difference yourself
+docker images
+
+# logs
+docker compose logs -f
+docker compose logs -f server
+docker compose logs -f client
+
+# stop everything
+docker compose down
+```
+
+---
+
+## single-stage vs multi-stage, side by side
+
+```bash
+single-stage server image:
+  base image (bun)        ~100mb
+  + all node_modules       ~200mb  (includes devDeps)
+  + source .ts files       ~1mb
+  + compiled dist/         ~1mb
+  ─────────────────────────────
+  total                   ~302mb
+
+multi-stage server image:
+  base image (bun)        ~100mb
+  + runtime node_modules   ~30mb   (no devDeps)
+  + compiled dist/         ~1mb
+  ─────────────────────────────
+  total                   ~131mb
+
+multi-stage client image:
+  base image (nginx:alpine) ~8mb
+  + static html/css/js      ~5mb
+  ─────────────────────────────
+  total                    ~13mb
+```
+
+smaller images = faster pulls from registry, faster deploys, smaller attack surface,
+less storage cost. in production this matters a lot.
