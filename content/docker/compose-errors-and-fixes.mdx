@@ -1,0 +1,247 @@
+---
+title: docker compose errors and fixes
+desc: every annoying docker compose error i've hit, why it happened, and how to fix it
+tag: docker
+---
+
+stuff i keep hitting when running docker compose locally. keeping this here so i stop googling the same errors.
+
+## port already allocated
+
+### the error
+
+```bash
+Error response from daemon: failed to set up container networking:
+driver failed programming external connectivity on endpoint sms-api-prod:
+Bind for 0.0.0.0:5000 failed: port is already allocated
+```
+
+### why it happens
+
+a previous docker container or a `docker-proxy` process from an earlier run is still holding the port. happens a lot when you ctrl+c out of compose instead of doing a clean `docker compose down`. sometimes it's a completely different project's container squatting on the same port.
+
+### how to find what's holding the port
+
+```bash
+# lsof sometimes misses ghost docker-proxy processes, use ss instead
+sudo ss -tlnp | grep 5000
+
+# also check if another container from a different project is using it
+docker ps -a | grep 5000
+```
+
+`ss -tlnp` breakdown:
+
+- `-t` — tcp only
+- `-l` — listening sockets only
+- `-n` — show port numbers not service names
+- `-p` — show the process using the socket
+
+### fixes
+
+if it's a stale `docker-proxy` process:
+
+```bash
+sudo kill -9 <PID>
+```
+
+if it's another container from a different project:
+
+```bash
+docker stop <container-name>
+# or if you don't need it at all
+docker rm -f <container-name>
+```
+
+`-f` in `docker rm -f` means force — it stops the container first if it's running, then removes it. without `-f` you'd have to stop it manually before removing.
+
+if nothing shows up but the port is still blocked, restart the docker daemon to clear all stale bindings:
+
+```bash
+sudo systemctl restart docker
+```
+
+---
+
+## container not joining the network / dns lookup failing
+
+### the error
+
+```bash
+error: failed to open database: dial tcp: lookup db on 192.168.18.1:53:
+dial udp 192.168.18.1:53: connect: network is unreachable
+```
+
+### why it happens
+
+the api container is trying to resolve the hostname `db` (the postgres service name) but docker's internal dns isn't resolving it. this means the container isn't attached to the shared `app-network`. docker's internal dns runs at `127.0.0.11` — if it's hitting your router ip (`192.168.18.1`) instead, the container never joined the right network.
+
+usually happens when:
+
+- the api container crashes and restarts before docker finishes attaching it to the network
+- stale cached images from before network config was added
+- the container exits with code 1 immediately, and docker restarts it in a broken state
+
+### check if the container is on the network
+
+```bash
+docker inspect sms-api-prod --format '{{json .NetworkSettings.Networks}}' | jq
+```
+
+healthy output looks like:
+
+```json
+{
+  "sms-prod_app-network": {
+    "IPAddress": "172.18.0.3",
+    ...
+  }
+}
+```
+
+broken output looks like:
+
+```json
+{}
+```
+
+empty `{}` means the container never joined the network.
+
+### fix — full wipe and rebuild
+
+```bash
+docker compose down --remove-orphans -v
+docker rm -f sms-api-prod sms-web-prod sms-db-prod 2>/dev/null
+docker network rm sms-prod_app-network 2>/dev/null
+docker compose build --no-cache
+docker compose up
+```
+
+command breakdown:
+
+```bash
+# stops and removes containers
+# --remove-orphans also removes containers for services no longer in the compose file
+docker compose down --remove-orphans
+
+# -v removes named volumes too — drop this if you want to keep db data
+docker compose down --remove-orphans -v
+
+# force removes specific containers (-f = stop first if running, then remove)
+# 2>/dev/null = redirect stderr to the void so missing containers don't throw noise
+docker rm -f sms-api-prod sms-web-prod sms-db-prod 2>/dev/null
+
+# explicitly remove the network in case it's in a broken state
+docker network rm sms-prod_app-network 2>/dev/null
+
+# rebuild images from scratch, ignore all cached layers
+docker compose build --no-cache
+```
+
+---
+
+## api starts before postgres is ready
+
+### why it happens
+
+`depends_on` by default only waits for the container to _start_, not for postgres to actually be ready to accept connections. so the api tries to connect, postgres isn't ready yet, connection fails.
+
+### fix — healthcheck + depends_on condition
+
+add a healthcheck to the db service and tell the api to wait until it passes:
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: sms-db-prod
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # ... rest of db config
+
+  api:
+    depends_on:
+      db:
+        condition: service_healthy
+    # ... rest of api config
+```
+
+`pg_isready` is a postgres utility that returns exit code 0 when the server is ready to accept connections. compose uses the exit code to determine health.
+
+without `condition: service_healthy`, compose just waits for the container process to start — postgres process can be running but not yet ready for connections.
+
+---
+
+## db connection retry in go
+
+### why it matters
+
+even with the healthcheck, the api container can still start and attempt to connect before the network is fully attached (especially on restart). if your app calls `log.Fatal` or `os.Exit(1)` on the first failed connection, docker restarts it in a broken state where the network isn't attached.
+
+the fix is to retry the connection a few times before giving up.
+
+### the retry loop
+
+in `main.go`, wrap your db connection call:
+
+```go
+var db *database.DB
+var err error
+
+for i := range 10 {
+    db, err = database.New(ctx, cfg.DatabaseURL)
+    if err == nil {
+        break
+    }
+    slog.Warn("failed to connect to database, retrying...", "attempt", i+1, "err", err)
+    time.Sleep(2 * time.Second)
+}
+if err != nil {
+    log.Fatalf("database: %v", err)
+}
+```
+
+this gives docker 20 seconds (10 attempts x 2s) to fully attach the network and for postgres to be ready before the app gives up. no shell scripts, no entrypoint wrappers — just go.
+
+---
+
+## standard stop/start flow
+
+because `docker compose down` alone sometimes leaves ghost port bindings:
+
+```bash
+docker compose down && sudo systemctl restart docker && docker compose up -d
+```
+
+- `docker compose down` — clean shutdown and remove containers and networks
+- `systemctl restart docker` — clears all stale port bindings the daemon might be holding
+- `-d` — detached mode, runs in background so containers don't die when you close the terminal
+
+watch logs after:
+
+```bash
+docker logs -f sms-api-prod
+```
+
+`-f` is follow — streams new log lines as they come in, like `tail -f`.
+
+---
+
+## postgres port conflict
+
+same "port already allocated" issue but for 5432. check and kill the same way:
+
+```bash
+sudo ss -tlnp | grep 5432
+docker ps -a | grep 5432
+```
+
+common culprit: a local postgres instance running on the host (not in docker) already using 5432. either stop the host postgres or change the compose port mapping to something like `5433:5432`.
+
+```bash
+# stop host postgres if you don't need it
+sudo systemctl stop postgresql
+```
