@@ -17,7 +17,7 @@ export default function CopyButton() {
     <div className="absolute right-3 top-3 z-10 group/btn">
       <button
         onClick={handleCopy}
-        className="opacity-0 group-hover:opacity-100 transition-all duration-150 text-[#444] hover:text-[#aaa] p-1.5 rounded-sm bg-[#0a0a0a] border border-[#1a1a1a]"
+        className="opacity-0 group-hover:opacity-100 transition-all duration-150 text-cx-dim hover:text-cx-accent p-1.5 rounded-sm bg-cx-subtle border border-cx-border"
       >
         {copied ? (
           <svg
@@ -50,7 +50,7 @@ export default function CopyButton() {
           </svg>
         )}
       </button>
-      <span className="pointer-events-none absolute right-0 top-8 opacity-0 group-hover/btn:opacity-100 transition-opacity duration-150 font-mono text-[10px] text-[#aaa] bg-[#111] border border-[#1a1a1a] px-2 py-1 rounded-sm whitespace-nowrap">
+      <span className="pointer-events-none absolute right-0 top-8 opacity-0 group-hover/btn:opacity-100 transition-opacity duration-150 font-mono text-[10px] text-cx-accent bg-cx-hover border border-cx-border px-2 py-1 rounded-sm whitespace-nowrap">
         {!copied && "copy"}
       </span>
     </div>

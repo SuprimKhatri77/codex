@@ -4,6 +4,9 @@ import "./globals.css";
 import { cn } from "@/lib/utils";
 import Link from "next/link";
 import Search from "@/components/Search";
+import { ThemeProvider } from "@/components/ThemeProvider";
+import ThemeScript from "@/components/ThemeScript";
+import ThemeToggle from "@/components/ThemeToggle";
 import { getAllNotes } from "@/lib/mdx";
 
 const jetbrainsMono = JetBrains_Mono({
@@ -62,27 +65,36 @@ export default function RootLayout({
     <html
       lang="en"
       className={cn(
-        "h-full",
+        "h-full dark",
         "antialiased",
         geistSans.variable,
         geistMono.variable,
         "font-mono",
         jetbrainsMono.variable,
       )}
+      suppressHydrationWarning
     >
-      <body className="min-h-full flex flex-col bg-[#0d0d0d] ">
-        <nav className="fixed top-0 left-0 right-0 z-40 bg-[#0d0d0d] border-b border-[#1a1a1a]">
-          <div className="max-w-4xl mx-auto px-8 h-12 flex items-center justify-between">
-            <Link
-              href="/"
-              className="font-mono text-[11px] text-[#444] hover:text-[#aaa] tracking-[0.15em] uppercase transition-colors"
-            >
-              ~/codex
-            </Link>
-            <Search notes={allNotes} />
-          </div>
-        </nav>
-        <div className="pt-12">{children}</div>
+      <head>
+        <ThemeScript />
+      </head>
+      <body className="min-h-full flex flex-col bg-cx">
+        <ThemeProvider>
+          <nav className="fixed top-0 left-0 right-0 z-40 bg-cx border-b border-cx-border">
+            <div className="max-w-4xl mx-auto px-8 h-12 flex items-center justify-between">
+              <Link
+                href="/"
+                className="font-mono text-[11px] text-cx-dim hover:text-cx-accent tracking-[0.15em] uppercase transition-colors"
+              >
+                ~/codex
+              </Link>
+              <div className="flex items-center gap-3">
+                <ThemeToggle />
+                <Search notes={allNotes} />
+              </div>
+            </div>
+          </nav>
+          <div className="pt-12">{children}</div>
+        </ThemeProvider>
       </body>
     </html>
   );

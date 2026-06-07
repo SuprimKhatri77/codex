@@ -13,10 +13,10 @@ export default function MdxLayout({ children }: { children: React.ReactNode }) {
   const label = segments[segments.length - 1].replace(/-/g, " ");
 
   return (
-    <div className="min-h-screen bg-[#0d0d0d] px-8 py-12 max-w-3xl mx-auto">
+    <div className="min-h-screen bg-cx px-8 py-12 max-w-3xl mx-auto">
       <Link
         href={backHref}
-        className="font-mono text-[11px] text-[#444] hover:text-[#aaa] tracking-[0.15em] uppercase transition-colors mb-12 block"
+        className="font-mono text-[11px] text-cx-dim hover:text-cx-accent tracking-[0.15em] uppercase transition-colors mb-12 block"
       >
         ← {label}
       </Link>
