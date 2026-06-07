@@ -8,43 +8,43 @@ import TableOfContents from "./TableOfContents";
 
 const components: MDXComponents = {
   h1: ({ children }) => (
-    <h1 className="text-3xl font-light tracking-tight text-white mb-2">
+    <h1 className="text-3xl font-light tracking-tight text-cx-heading mb-2">
       {children}
     </h1>
   ),
   h2: ({ children, ...props }) => (
     <h2
-      className="font-mono text-[10px] text-[#444] tracking-[0.2em] uppercase mt-12 mb-4 pb-2 border-b border-[#1a1a1a]"
+      className="font-mono text-[10px] text-cx-dim tracking-[0.2em] uppercase mt-12 mb-4 pb-2 border-b border-cx-border"
       {...props}
     >
       {children}
     </h2>
   ),
   h3: ({ children, ...props }) => (
-    <h3 className="text-sm font-medium text-[#ccc] mt-6 mb-2" {...props}>
+    <h3 className="text-sm font-medium text-cx-title mt-6 mb-2" {...props}>
       {children}
     </h3>
   ),
   p: ({ children }) => (
-    <p className="text-sm text-[#666] leading-relaxed mb-4 font-mono">
+    <p className="text-sm text-cx-body leading-relaxed mb-4 font-mono">
       {children}
     </p>
   ),
   ul: ({ children }) => <ul className="space-y-2 mb-6 ml-4">{children}</ul>,
   li: ({ children }) => (
-    <li className="font-mono text-[12px] text-[#666] flex gap-2 before:content-['→'] before:text-[#333]">
+    <li className="font-mono text-[12px] text-cx-body flex gap-2 before:content-['→'] before:text-cx-faint">
       {children}
     </li>
   ),
   strong: ({ children }) => (
-    <strong className="text-[#ccc] font-medium">{children}</strong>
+    <strong className="text-cx-title font-medium">{children}</strong>
   ),
   pre: ({ children, ...props }) => (
     <div className="relative group mb-6">
       <CopyButton />
       <pre
         {...props}
-        className="overflow-x-auto p-4 rounded-lg bg-[#0a0a0a] border border-[#1a1a1a] text-[12px] leading-relaxed font-mono"
+        className="overflow-x-auto p-4 rounded-lg bg-cx-subtle border border-cx-border text-[12px] leading-relaxed font-mono"
       >
         {children}
       </pre>
@@ -62,10 +62,10 @@ export default function MdxContent({
   return (
     <MdxLayout>
       <TableOfContents content={content} />
-      <h1 className="text-3xl font-light tracking-tight text-slate-50/70 mb-1">
+      <h1 className="text-3xl font-light tracking-tight text-cx-heading/70 mb-1">
         {frontmatter.title}
       </h1>
-      <p className="font-mono text-[13px] text-[#555] mb-12">
+      <p className="font-mono text-[13px] text-cx-muted mb-12">
         {frontmatter.desc}
       </p>
       <MDXRemote
@@ -77,7 +77,10 @@ export default function MdxContent({
               rehypeSlug,
               [
                 rehypePrettyCode,
-                { theme: "github-dark-dimmed", keepBackground: false },
+                {
+                  theme: "dracula",
+                  keepBackground: true,
+                },
               ],
             ],
           },

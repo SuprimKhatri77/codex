@@ -45,7 +45,7 @@ export default function TableOfContents({ content }: { content: string }) {
 
   return (
     <nav className="hidden xl:block fixed top-24 right-8 w-48">
-      <p className="font-mono text-[10px] text-[#333] tracking-[0.2em] uppercase mb-4">
+      <p className="font-mono text-[10px] text-cx-faint tracking-[0.2em] uppercase mb-4">
         on this page
       </p>
       <ul className="space-y-2">
@@ -56,8 +56,8 @@ export default function TableOfContents({ content }: { content: string }) {
           >
             <Link
               href={`#${h.id}`}
-              className={`font-mono text-[11px] transition-colors duration-150 hover:text-[#aaa] block leading-relaxed ${
-                active === h.id ? "text-[#aaa]" : "text-[#333]"
+              className={`font-mono text-[11px] transition-colors duration-150 hover:text-cx-accent block leading-relaxed ${
+                active === h.id ? "text-cx-accent" : "text-cx-faint"
               }`}
             >
               {h.text}

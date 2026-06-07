@@ -26,10 +26,10 @@ export default function Search({ notes }: { notes: Note[] }) {
     <>
       <button
         onClick={() => setOpen(true)}
-        className="flex items-center gap-3 font-mono text-[11px] text-[#444] hover:text-[#aaa] transition-colors border border-[#1a1a1a] hover:border-[#333] px-3 py-1.5 rounded-sm"
+        className="flex items-center gap-3 font-mono text-[11px] text-cx-dim hover:text-cx-accent transition-colors border border-cx-border hover:border-cx-faint px-3 py-1.5 rounded-sm"
       >
         <span>search notes</span>
-        <span className="text-[#333] border border-[#2a2a2a] px-1.5 py-0.5">
+        <span className="text-cx-faint border border-cx-border-strong px-1.5 py-0.5">
           ⌘K
         </span>
       </button>

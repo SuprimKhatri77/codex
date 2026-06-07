@@ -55,12 +55,12 @@ const notes = [
 
 export default function Home() {
   return (
-    <main className="min-h-screen bg-[#0d0d0d] text-[#e8e8e8] px-8 py-12 max-w-4xl mx-auto">
+    <main className="min-h-screen bg-cx text-cx-fg px-8 py-12 max-w-4xl mx-auto">
       <div className="mb-12">
-        <h1 className="text-4xl font-light tracking-tight text-[#e8e8e8] mb-2">
-          my dev <span className="font-medium text-white">notes</span>
+        <h1 className="text-4xl font-light tracking-tight text-cx-fg mb-2">
+          my dev <span className="font-medium text-cx-heading">notes</span>
         </h1>
-        <p className="font-mono text-[13px] text-[#555]">
+        <p className="font-mono text-[13px] text-cx-muted">
           {"//"} things i figured out, written down
         </p>
       </div>
@@ -68,11 +68,11 @@ export default function Home() {
       <div className="space-y-10">
         {notes.map((group) => (
           <div key={group.section}>
-            <p className="font-mono text-[10px] text-[#444] tracking-[0.2em] uppercase mb-3 pb-2 border-b border-[#1a1a1a]">
+            <p className="font-mono text-[10px] text-cx-dim tracking-[0.2em] uppercase mb-3 pb-2 border-b border-cx-border">
               {group.section}
             </p>
             <div
-              className={`grid gap-px bg-[#1a1a1a] border border-[#1a1a1a] rounded-lg overflow-hidden ${
+              className={`grid gap-px bg-cx-border border border-cx-border rounded-lg overflow-hidden ${
                 group.items.length === 1
                   ? "grid-cols-1"
                   : "grid-cols-1 sm:grid-cols-2"
@@ -82,20 +82,20 @@ export default function Home() {
                 <Link
                   key={item.slug}
                   href={item.slug}
-                  className="group bg-[#0d0d0d] hover:bg-[#111] p-5 transition-colors duration-150"
+                  className="group bg-cx hover:bg-cx-hover p-5 transition-colors duration-150"
                 >
                   <div className="flex items-center justify-between mb-3">
-                    <span className="font-mono text-[10px] text-[#444] bg-[#141414] border border-[#1e1e1e] px-2 py-0.5 rounded-sm">
+                    <span className="font-mono text-[10px] text-cx-dim bg-cx-tag border border-cx-border-subtle px-2 py-0.5 rounded-sm">
                       {item.tag}
                     </span>
-                    <span className="text-[#333] group-hover:text-[#666] text-xs transition-colors duration-150">
+                    <span className="text-cx-faint group-hover:text-cx-body text-xs transition-colors duration-150">
                       ↗
                     </span>
                   </div>
-                  <p className="text-sm font-medium text-[#ccc] group-hover:text-[#e8e8e8] mb-1 transition-colors duration-150">
+                  <p className="text-sm font-medium text-cx-title group-hover:text-cx-fg mb-1 transition-colors duration-150">
                     {item.title}
                   </p>
-                  <p className="font-mono text-[12px] text-[#444]">
+                  <p className="font-mono text-[12px] text-cx-dim">
                     {item.desc}
                   </p>
                 </Link>
@@ -105,7 +105,7 @@ export default function Home() {
         ))}
       </div>
 
-      <p className="font-mono text-[11px] text-[#2a2a2a] mt-12">
+      <p className="font-mono text-[11px] text-cx-footer mt-12">
         {"//"} more notes coming as i build things
       </p>
     </main>
