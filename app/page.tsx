@@ -62,6 +62,17 @@ const notes = [
       },
     ],
   },
+  {
+    section: "Auth",
+    items: [
+      {
+        slug: "/auth",
+        tag: "auth",
+        title: "Auth notes",
+        desc: "authentication, authorization, best practices",
+      },
+    ],
+  },
 ];
 
 export default function Home() {

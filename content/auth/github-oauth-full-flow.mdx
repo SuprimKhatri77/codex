@@ -1,0 +1,608 @@
+---
+title: github oauth from scratch with std lib
+desc: full sign-in-with-github flow built with net/http instead of golang.org/x/oauth2, plus jwt + refresh token issuance
+tag: auth
+---
+
+## the two-hop redirect shape
+
+oauth isn't a single api call, it's two full browser redirects plus some server-to-server calls hidden in between:
+
+### the flow
+
+1. user clicks "sign in with github" -> browser does a full page redirect to github's authorize url (NOT a fetch call, the whole tab navigates away)
+2. github shows its own consent screen
+3. user authorizes -> github redirects the browser BACK to your registered redirect_uri, with a `code` query param attached
+4. your backend's callback route receives this as a normal GET request
+5. your backend calls github SERVER-TO-SERVER to exchange `code` for an access token (this is the only actual "api call" in the traditional sense — everything else is a browser redirect)
+6. your backend calls github's `/user` endpoint with that access token to get profile info
+7. your backend does its own user lookup/creation, issues its OWN jwt/refresh tokens, and redirects the browser one more time to your frontend
+
+### redirect_uri vs homepage url
+
+- **redirect_uri** — must be a url on YOUR backend, pre-registered with github in advance. github will only redirect there. security constraint: prevents an attacker pointing github at their own domain to steal the code
+- **homepage url** — user-facing metadata shown on github's consent screen only. github never redirects there — points to the frontend
+- **authorization callback url** — the real technical redirect target — points to the backend
+
+### dev vs prod
+
+github oauth apps only allow ONE registered callback url per app, so local dev needs its own separate github oauth app (different client_id/secret, callback pointed at localhost) rather than reusing the prod one.
+
+---
+
+## why not golang.org/x/oauth2
+
+deliberately built this with plain net/http instead of the oauth2 library, specifically to learn calling external apis in go by hand.
+
+### what x/oauth2 would and wouldn't replace
+
+- would replace `exchangeCodeForToken` with a single `.Exchange(ctx, code)` call
+- would NOT replace fetching profile data (`/user`, `/user/emails`) — that's github-rest-api-specific, not part of the oauth2 spec at all
+- worth learning the manual version first because "build an http request, set headers, decode json defensively" transfers to literally every external api call you'll ever make (stripe, google, anything) — it's not gin-specific or oauth-specific
+
+### cleanup
+
+to remove an unused installed package: `go mod tidy` (scans actual imports across the codebase and prunes anything unused from go.mod/go.sum automatically).
+
+---
+
+## state param — the actual csrf protection
+
+state is a random, unguessable, single-use string. NOT hashed (no db row to protect at rest — it never touches the database, it's cookie-only, transient). needs to be unpredictable, that's it. crypto/rand already gives you that, hashing an already-random value adds nothing.
+
+### generating state
+
+```go
+func generateRandomToken() (string, error) {
+    b := make([]byte, 32)
+    if _, err := rand.Read(b); err != nil {
+        return "", err
+    }
+    return base64.URLEncoding.EncodeToString(b), nil
+}
+```
+
+- **crypto/rand not math/rand** — math/rand is predictable if someone knows/guesses the seed, defeats the entire point
+- **base64.URLEncoding not StdEncoding** — standard base64 can contain `+` and `/` which need escaping in a url query param, url-safe encoding uses `-` and `_` instead
+
+### the attack this prevents
+
+attacker starts their OWN oauth flow with github using their OWN account, gets a real valid `code` back for THEIR account. tricks a victim's browser into visiting `yourapp.com/auth/github/callback?code=attackers-code` (email link, img tag, whatever). if the victim is logged in, your callback would exchange that code and potentially link the attacker's github identity to the victim's session.
+
+### why state blocks it
+
+- the state cookie was set on the VICTIM's browser during the victim's own real click-through
+- the attacker can't forge that cookie — they never triggered step 1 as the victim, their own flow set a DIFFERENT state cookie on their own browser
+- when the forged link hits the victim's browser, the state in the forged url won't match whatever's (or isn't) in the victim's actual cookie. mismatch -> reject
+- state isn't secret, it's a MATCHING proof tied to cookie possession — the check isn't "is this value secret", it's "does the state in the url match the state in this specific browser's cookie", which proves this exact browser initiated this exact flow
+
+### storage rules
+
+- httpOnly cookie, NOT a db table — genuinely correct use of httpOnly. the cookie has zero frontend use case ever, only your backend ever reads it
+- also **Secure** (https only)
+- **5-10 min maxAge** — long enough to cover a human pausing on github's consent screen, short enough to limit replay window
+
+### login handler
+
+```go
+func GithubLoginHandler(cfg *config.Config) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        state, err := generateRandomToken()
+        if err != nil {
+            c.AbortWithStatus(http.StatusInternalServerError)
+            return
+        }
+
+        utils.SetCookie(c, "oauth_state", state, 600, cfg)
+
+        params := url.Values{}
+        params.Set("client_id", cfg.GithubClientID)
+        params.Set("redirect_uri", cfg.GithubRedirectURI)
+        params.Set("scope", "read:user user:email")
+        params.Set("state", state)
+
+        authURL := "https://github.com/login/oauth/authorize?" + params.Encode()
+        c.Redirect(http.StatusTemporaryRedirect, authURL)
+    }
+}
+```
+
+### cookie clearing timing
+
+- `SetCookie` with `maxAge=-1` doesn't delete anything server-side immediately — it queues a Set-Cookie header that goes out in the http response
+- the browser is what actually expires it, on receiving that response
+- calling it early in a handler doesn't affect anything you read later in the SAME request (gin buffers headers, flushes at the end), so it's safe to read the cookie's value first, then queue the clear, then compare — order within the function doesn't matter for this reason
+
+### clear on both paths
+
+clear state on BOTH the success and failure path of the verification check, not just success — it's meant to be single-use, so make that literal rather than leaving an unused-but-still-valid cookie sitting around.
+
+```go
+utils.SetCookie(c, "oauth_state", "", -1, cfg) // clear regardless of match or mismatch
+
+cookieState, err := c.Cookie("oauth_state")
+if err != nil || cookieState != params.State {
+    c.JSON(http.StatusForbidden, types.Error("Invalid state", constants.InvalidState))
+    return
+}
+```
+
+---
+
+## the code exchange — std lib, form-encoded not json
+
+github's token endpoint expects classic html-form encoding in the request body (`client_id=x&client_secret=y&code=z`), NOT json. that's the whole reason for setting `Content-Type: application/x-www-form-urlencoded`.
+
+`url.Values` is go's type for url-encoded key-value pairs — used both for query strings AND form-encoded bodies, since the encoding format is identical either way, just placed in different locations. name feels ambiguous but it's the same encoding either way.
+
+```go
+var githubHTTPClient = &http.Client{
+    Timeout: 10 * time.Second,
+}
+
+func exchangeCodeForToken(ctx context.Context, cfg *config.Config, code string) (string, error) {
+    formData := url.Values{}
+    formData.Set("client_id", cfg.GithubClientID)
+    formData.Set("client_secret", cfg.GithubClientSecret)
+    formData.Set("code", code)
+    formData.Set("redirect_uri", cfg.GithubRedirectURI)
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+        "https://github.com/login/oauth/access_token",
+        strings.NewReader(formData.Encode()))
+    if err != nil {
+        return "", fmt.Errorf("building token request: %w", err)
+    }
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded") // format of what we're SENDING
+    req.Header.Set("Accept", "application/json")                         // format we want BACK
+
+    resp, err := githubHTTPClient.Do(req)
+    if err != nil {
+        return "", fmt.Errorf("calling github token endpoint: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return "", fmt.Errorf("github token endpoint returned status %d", resp.StatusCode)
+    }
+
+    var tokenResp struct {
+        AccessToken string `json:"access_token"`
+        Error       string `json:"error"`
+        ErrorDesc   string `json:"error_description"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+        return "", fmt.Errorf("decoding token response: %w", err)
+    }
+
+    // github returns 200 OK even on failure, with an "error" field in the body instead
+    // of a proper 4xx status — this is oauth-endpoint-specific quirky behavior, must
+    // check explicitly here. the /user and /user/emails endpoints below do NOT need this,
+    // they're normal rest endpoints and use real status codes.
+    if tokenResp.Error != "" {
+        return "", fmt.Errorf("github oauth error: %s - %s", tokenResp.Error, tokenResp.ErrorDesc)
+    }
+    if tokenResp.AccessToken == "" {
+        return "", errors.New("github returned empty access token")
+    }
+
+    return tokenResp.AccessToken, nil
+}
+```
+
+### things worth naming individually
+
+- `strings.NewReader(formData.Encode())` — Encode() builds the actual "key=val&key2=val2" string (with proper escaping, same idea as js encodeURIComponent). NewRequestWithContext needs an io.Reader for its body param, not a raw string — NewReader just wraps the string so it satisfies that interface. no json marshaling involved anywhere in this function
+- `http.DefaultClient` has NO default timeout — a hanging github request would block the handler's goroutine indefinitely. always use a client with an explicit Timeout instead of DefaultClient for any external call
+- `client.Do(req)` returning a non-nil err means a TRANSPORT failure (dns, connection refused, timeout) — NOT a 4xx/5xx response. a 404 or 500 is still err == nil, just check resp.StatusCode separately. same "gotcha" as js fetch not rejecting on http error statuses
+- `defer resp.Body.Close()` goes right after confirming resp is non-nil, regardless of whether the body ends up getting read/decoded or not — resp.Body is a live connection resource, leaving it open leaks file descriptors / pool slots
+
+---
+
+## fetching profile data
+
+```go
+type GithubUser struct {
+    ID        int64  `json:"id"`         // github's permanent internal user id — use THIS for provider_account_id
+    Login     string `json:"login"`      // username, can change, don't use as a stable identifier
+    Name      string `json:"name"`
+    Email     string `json:"email"`
+    AvatarURL string `json:"avatar_url"`
+}
+
+func fetchGithubUser(ctx context.Context, accessToken string) (*GithubUser, error) {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user", nil)
+    if err != nil {
+        return nil, fmt.Errorf("building user request: %w", err)
+    }
+    req.Header.Set("Authorization", "Bearer "+accessToken)
+    req.Header.Set("Accept", "application/vnd.github+json")
+
+    resp, err := githubHTTPClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("calling github user endpoint: %w", err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("github user endpoint returned status %d", resp.StatusCode)
+    }
+
+    var ghUser GithubUser
+    if err := json.NewDecoder(resp.Body).Decode(&ghUser); err != nil {
+        return nil, fmt.Errorf("decoding github user: %w", err)
+    }
+
+    // email can be null/private on /user — fall back to /user/emails for the verified primary
+    if ghUser.Email == "" {
+        email, err := fetchGithubPrimaryEmail(ctx, accessToken)
+        if err != nil {
+            return nil, fmt.Errorf("fetching github primary email: %w", err)
+        }
+        ghUser.Email = email
+    }
+
+    if ghUser.Email == "" {
+        return nil, errors.New("could not obtain email from github")
+    }
+
+    return &ghUser, nil
+}
+
+func fetchGithubPrimaryEmail(ctx context.Context, accessToken string) (string, error) {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/user/emails", nil)
+    if err != nil {
+        return "", err
+    }
+    req.Header.Set("Authorization", "Bearer "+accessToken)
+    req.Header.Set("Accept", "application/vnd.github+json")
+
+    resp, err := githubHTTPClient.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        // don't wrap err here — err is nil at this point since Do() already succeeded,
+        // %w-wrapping a nil error just produces a useless message. use the status code itself.
+        return "", fmt.Errorf("github email endpoint returned status %d", resp.StatusCode)
+    }
+
+    var emails []struct {
+        Email    string `json:"email"`
+        Primary  bool   `json:"primary"`
+        Verified bool   `json:"verified"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&emails); err != nil {
+        return "", err
+    }
+
+    for _, e := range emails {
+        if e.Primary && e.Verified {
+            return e.Email, nil
+        }
+    }
+    return "", errors.New("no verified primary email found")
+}
+```
+
+### id vs login
+
+- **id** — permanent. use THIS for `provider_account_id`
+- **login** (username) — can be changed by the user at any time
+- if you used login and someone renamed their github username, the next lookup by old login would fail to find them and you'd accidentally create a duplicate user/account row for the same actual person
+
+---
+
+## why user creation + account linking needs a transaction
+
+creating `core.users` and `core.accounts` are two separate inserts that represent ONE logical action ("this person signed up via github").
+
+### the problem without a transaction
+
+- a crash/error between the two inserts leaves a user row with no linked account
+- permanently broken state — that user can never log back in via oauth since the account link that maps github's id back to them doesn't exist
+
+### AuthTxRepository
+
+used repository pattern with a WithTx variant, same shape as used elsewhere (e.g. gym project's SubscriptionTxRepository):
+
+```go
+type AuthTxRepository interface {
+    WithTx(tx pgx.Tx) AuthTxRepository
+    GetUserByEmail(ctx context.Context, email string) (db.CoreUser, error)
+    CreateUser(ctx context.Context, params db.CreateUserParams) (db.CoreUser, error)
+    CreateAccount(ctx context.Context, params db.CreateAccountParams) (db.CoreAccount, error)
+}
+
+type authTxRepository struct {
+    queries *db.Queries
+    pool    *pgxpool.Pool
+}
+
+func (r *authTxRepository) WithTx(tx pgx.Tx) AuthTxRepository {
+    return &authTxRepository{queries: r.queries.WithTx(tx), pool: r.pool}
+}
+```
+
+### why pgx.BeginFunc
+
+- takes db as an inline interface `interface{Begin(ctx) (pgx.Tx, error)}`, NOT specifically `*pgxpool.Pool` — structural typing, `*pgxpool.Pool` just happens to already have a matching Begin method
+- also works with anything else in pgx that has Begin
+- calls Commit if your closure returns nil, calls Rollback if it returns a non-nil error
+- removes an entire class of mistake (forgetting the defer, forgetting to commit on some branch, accidentally falling through to a commit after a path that should've rolled back) since there's exactly ONE exit signal (the return value) instead of manually managing two separate calls across multiple branches
+
+### full callback handler
+
+```go
+func GithubCallbackHandler(txRepo repository.AuthTxRepository, repo repository.AuthRepository, cfg *config.Config, pool *pgxpool.Pool) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        ctx := c.Request.Context()
+
+        var params GithubCallbackHandlerParams
+        if err := c.ShouldBindQuery(&params); err != nil {
+            c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/auth?error=invalid_request")
+            return
+        }
+
+        utils.SetCookie(c, "oauth_state", "", -1, cfg)
+        cookieState, err := c.Cookie("oauth_state")
+        if err != nil || cookieState != params.State {
+            c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/auth?error=invalid_state")
+            return
+        }
+
+        accessToken, err := exchangeCodeForToken(ctx, cfg, params.Code)
+        if err != nil {
+            handlerlog.Error(c, "github token exchange failed", err)
+            c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/auth?error=auth_failed")
+            return
+        }
+
+        ghUser, err := fetchGithubUser(ctx, accessToken)
+        if err != nil {
+            handlerlog.Error(c, "github profile fetch failed", err)
+            c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/auth?error=auth_failed")
+            return
+        }
+
+        var user db.CoreUser
+        err = pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+            qtx := txRepo.WithTx(tx)
+
+            existingUser, err := qtx.GetUserByEmail(ctx, ghUser.Email)
+            if err != nil {
+                if !errors.Is(err, pgx.ErrNoRows) {
+                    return fmt.Errorf("%w: %v", ErrUserLookupFailed, err)
+                }
+
+                newUser, err := qtx.CreateUser(ctx, db.CreateUserParams{
+                    Name:      utils.ToNullableText(ghUser.Name),
+                    Email:     ghUser.Email,
+                    AvatarUrl: utils.ToNullableText(ghUser.AvatarURL),
+                })
+                if err != nil {
+                    return fmt.Errorf("%w: %v", ErrUserCreationFailed, err)
+                }
+
+                _, err = qtx.CreateAccount(ctx, db.CreateAccountParams{
+                    UserID:            newUser.ID,
+                    Provider:          "github",
+                    ProviderAccountID: strconv.FormatInt(ghUser.ID, 10),
+                })
+                if err != nil {
+                    return fmt.Errorf("%w: %v", ErrAccountLinkFailed, err)
+                }
+
+                user = newUser
+                return nil
+            }
+
+            user = existingUser
+            return nil
+        })
+
+        if err != nil {
+            handlerlog.Error(c, "github oauth: user provisioning failed", err)
+            c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/auth?error=auth_failed")
+            return
+        }
+
+        if err := generateAccessAndRefreshToken(c, cfg, user, repo); err != nil {
+            handlerlog.Error(c, "token generation failed", err)
+            c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/auth?error=auth_failed")
+            return
+        }
+
+        // TODO: check core.tenant_members for this user_id, redirect to /dashboard if found,
+        // /onboarding if not (covers both brand new users AND returning users who never
+        // finished onboarding)
+        c.Redirect(http.StatusTemporaryRedirect, cfg.FrontendURL+"/onboarding")
+    }
+}
+```
+
+### sentinel errors
+
+```go
+var (
+    ErrUserLookupFailed   = errors.New("failed to look up user")
+    ErrUserCreationFailed = errors.New("failed to create user")
+    ErrAccountLinkFailed  = errors.New("failed to link account")
+)
+```
+
+- the `%w` wrap preserves the original db error for logs (`err.Error()` still has the real postgres error text)
+- `errors.Is` lets you branch on WHICH kind of failure happened without string parsing
+- one error value carries both the classification and the original cause — no need for a parallel `var errMsg string` kept in sync by hand
+
+### error response design
+
+- end users only see a small, coarse set of error codes on the redirect (`invalid_state`, `auth_failed`) — NOT specific internals like "token exchange failed" vs "profile fetch failed"
+- two separate concerns: what the user sees (vague, safe, actionable) vs what gets logged server-side (full specific err value via `handlerlog.Error`)
+- never conflate these — showing `github_token_exchange_failed` to a user helps nobody and leaks internal flow details to anyone probing the auth system
+
+### redirect on every path
+
+- this endpoint IS the registered redirect_uri — it only ever receives raw browser GET navigations, not fetch calls from a running frontend
+- returning raw JSON here shows the user a blob of unstyled text with nothing to render it, since the browser has fully navigated away from the react app
+- every branch must end in `c.Redirect`, never `c.JSON`
+
+---
+
+## generating and storing the actual session tokens
+
+```go
+func generateAccessAndRefreshToken(c *gin.Context, cfg *config.Config, user db.CoreUser, repo repository.AuthRepository) error {
+    jti, err := generateRandomToken()
+    if err != nil {
+        return fmt.Errorf("generating jti: %w", err)
+    }
+
+    accessClaims := jwt.MapClaims{
+        "user_id":    user.ID,
+        "email":      user.Email,
+        "role":       user.Role,
+        "jti":        jti,
+        "exp":        time.Now().Add(15 * time.Minute).Unix(),
+    }
+    accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
+    accessTokenString, err := accessToken.SignedString([]byte(cfg.JWTAccessSecret))
+    if err != nil {
+        return fmt.Errorf("signing access token: %w", err)
+    }
+
+    refreshClaims := jwt.MapClaims{
+        "user_id": user.ID,
+        "jti":     jti,
+        "exp":     time.Now().Add(30 * 24 * time.Hour).Unix(),
+    }
+    refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
+    refreshTokenString, err := refreshToken.SignedString([]byte(cfg.JWTRefreshSecret))
+    if err != nil {
+        return fmt.Errorf("signing refresh token: %w", err)
+    }
+
+    // NEVER store the raw token — same principle as passwords. sha256 is fine here
+    // (not bcrypt) because refresh tokens are long random strings, not guessable —
+    // bcrypt's slowness exists specifically to resist brute-force guessing of low-entropy
+    // secrets like passwords, which doesn't apply here.
+    hash := sha256.Sum256([]byte(refreshTokenString))
+    tokenHash := hex.EncodeToString(hash[:])
+
+    expiresAt := pgtype.Timestamptz{Time: time.Now().Add(30 * 24 * time.Hour), Valid: true}
+
+    _, err = repo.CreateRefreshToken(c.Request.Context(), db.CreateRefreshTokenParams{
+        UserID:    user.ID,
+        TokenHash: tokenHash,
+        ExpiresAt: expiresAt,
+    })
+    if err != nil {
+        return fmt.Errorf("failed to create refresh token: %w", err)
+    }
+
+    setAuthCookies(refreshTokenString, accessTokenString, cfg, c)
+    return nil
+}
+```
+
+### why jti matters
+
+- `jwt.MapClaims` without any random field is fully DETERMINISTIC given the same user_id + exp
+- two logins for the same user within the same second (double-click, two tabs, retry after a blip) produce byte-identical jwts, therefore identical sha256 hashes, therefore a UNIQUE constraint violation on `token_hash` (or worse, silent collision if that constraint's missing)
+- jti is the standard jwt claim built exactly for this — a random per-token identifier, purely for entropy, not used for lookups
+- can reuse the same jti across the paired access+refresh token minted together, or generate two independent ones, either's fine
+
+### jti vs session_id
+
+this is NOT the same thing as the old session_id pattern from a previous project:
+
+- session_id was solving a DIFFERENT problem there (a bug where logout/login was revoking ALL of a user's refresh tokens by user_id instead of the one specific row being replaced — a query-scoping bug, not a missing-entropy bug)
+- the row's own primary key (`refresh_tokens.id`) already uniquely identifies each login/session for revocation purposes
+- jti only exists to keep the signed jwt STRING itself from colliding before it even reaches the db
+
+### logout revokes one row
+
+```sql
+-- name: RevokeRefreshToken :exec
+UPDATE core.refresh_tokens SET revoked = true WHERE id = $1;
+
+-- name: RevokeAllUserRefreshTokens :exec
+-- only for "log out everywhere" / security events, NEVER called on a normal login or
+-- normal single-session logout
+UPDATE core.refresh_tokens SET revoked = true WHERE user_id = $1 AND revoked = false;
+```
+
+### validity check in the query
+
+```sql
+-- name: GetRefreshTokenByHash :one
+SELECT * FROM core.refresh_tokens
+WHERE token_hash = $1 AND revoked = false AND expires_at > now();
+```
+
+"no rows" from this query already means "invalid, don't proceed" — nothing left to re-check in application code afterward.
+
+### index token_hash
+
+- UNIQUE, not just indexed — highest-frequency query against this table by far, hit on every refresh request
+- without an index it's a sequential scan on every single refresh
+- UNIQUE catches any accidental hash collision (which, given jti, should never legitimately happen) at the db level instead of silently allowing a duplicate
+
+---
+
+## jwt vs session-based auth, the actual tradeoff
+
+### session-based
+
+- server creates a session row (db/redis), client gets an opaque session_id cookie meaning nothing on its own
+- EVERY request does a lookup to validate + fetch the user
+- revocation = delete the row, instant
+
+### jwt-based (what this project uses)
+
+- token is self-contained, signed, carries its own claims
+- server just verifies the signature + reads claims directly, no db lookup needed per request
+- tradeoff: can't revoke a still-valid-by-expiry token early without extra machinery, since there's no "row to delete" for the access token itself
+
+### how this project bridges the gap
+
+- the redis access-token blacklist (on logout, block use before natural expiry) patches the one jwt gap — a small "these specific tokens are dead" list, checked in ADDITION to signature verification, only for the short access-token window
+- refresh tokens ARE stored in the db specifically because they're the one part of this system that needs to behave session-like (revocable, rotatable) — that's deliberate, not an inconsistency
+
+---
+
+## oauth is normal auth, minus password verification
+
+the one real conceptual addition: you're trusting github to have already done the "is this really the account owner" check on their end, and you just trust the signed response they hand back instead of checking a password hash yourself. everything downstream (issuing your own session, jwt/refresh split, revocation) is identical to any other auth scheme.
+
+---
+
+## known gap, deliberately deferred
+
+lookup is currently keyed on EMAIL (`GetUserByEmail`), not on `GetAccountByProvider(provider, provider_account_id)`.
+
+- works fine single-provider
+- the gap: once a second provider (google) is added, someone logging in with google using the same email as an existing github-linked account would get logged into the same user silently, WITHOUT ever getting an actual `core.accounts` row created for the google link
+- a future "connected accounts" ui would incorrectly show they only ever used github
+- fine to defer since the codebase is organized (`github_client.go` / `google_client.go` split, `tokens.go` is fully provider-agnostic already) such that fixing this later is a small, contained change — not a rewrite
+
+---
+
+## file organization
+
+split by what code DOES, not by provider:
+
+```
+auth/
+├── oauth_login.go     -- GithubLoginHandler (+ future GoogleLoginHandler)
+├── oauth_callback.go  -- GithubCallbackHandler (+ future GoogleCallbackHandler)
+├── github_client.go   -- exchangeCodeForToken, fetchGithubUser, fetchGithubPrimaryEmail, GithubUser struct
+├── tokens.go          -- generateAccessAndRefreshToken, setAuthCookies (fully provider-agnostic)
+├── logout.go
+├── me.go
+└── refresh.go
+```
+
+`tokens.go` never needs to change when google's added — token issuance was never provider-specific. `google_client.go` will mirror `github_client.go`'s three functions.
