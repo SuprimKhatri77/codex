@@ -32,8 +32,8 @@ const components: MDXComponents = {
   ),
   ul: ({ children }) => <ul className="space-y-2 mb-6 ml-4">{children}</ul>,
   li: ({ children }) => (
-    <li className="font-mono text-[12px] text-cx-body flex gap-2 before:content-['→'] before:text-cx-faint">
-      {children}
+    <li className="font-mono text-[12px] text-cx-body flex gap-2 before:content-['→'] before:text-cx-faint before:shrink-0">
+      <span className="min-w-0">{children}</span>
     </li>
   ),
   strong: ({ children }) => (

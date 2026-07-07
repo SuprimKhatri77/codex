@@ -1,0 +1,364 @@
+---
+title: multitenancy with schema-per-tenant
+desc: how the uptime monitor saas isolates tenant data using postgres schemas instead of a shared table with tenant_id
+tag: architecture
+---
+
+## why schema-per-tenant
+
+three ways to do multitenancy in postgres:
+
+- shared schema, tenant_id column on every table
+- database-per-tenant, fully separate postgres db per tenant
+- schema-per-tenant, one db, each tenant gets its own postgres schema
+
+### the choice
+
+went with schema-per-tenant. one postgres db, tenant gets a schema like `tenant_acmecorp`, isolated via `SET search_path` per request instead of `WHERE tenant_id = ?` on literally every query ever written.
+
+### why not shared-schema
+
+- every single query, forever, needs the tenant_id filter or you leak data
+- one missed WHERE clause in a big codebase and you've shown tenant A's data to tenant B
+- schema-per-tenant makes that class of bug structurally impossible for tenant-scoped tables — there's no shared table to leak from, tenant B's rows literally don't exist in tenant A's search_path
+
+### why not database-per-tenant
+
+- full isolation, but you're managing N databases, N connection pools, N migration runs
+- overkill unless you have huge tenants or compliance reasons to isolate at the infra level
+
+---
+
+## the two-schema split: core vs tenant_xxx
+
+not everything lives in a tenant schema. split is:
+
+- `core` schema — platform-wide stuff. identity, tenancy metadata, billing. queried before you even know which tenant you're dealing with, or queried across all tenants (superadmin stuff).
+- `tenant_acmecorp` schema (one per tenant) — that tenant's actual product data. monitors, checks, alerts. only ever queried once you're already inside that tenant's context.
+
+### placement test #1 — discover before context
+
+the actual test for "does this table go in core or in a tenant schema":
+
+can this data be queried using something the user already has in hand (their own user_id, an invite code) WITHOUT first knowing which tenant it belongs to? if yes, it has to be core, because the whole point of querying it is often to DISCOVER the tenant.
+
+**example: tenant_members**
+
+- you need "which tenants does user X belong to" at login time, before you've resolved any tenant context
+- if tenant_members lived inside each tenant schema, answering that would mean querying every tenant schema in the database looking for a match
+- that defeats the entire point of the isolation
+
+### placement test #2 — volume and blast-radius
+
+for things that pass the first test either way (could genuinely go either way structurally), ask: is this high-volume, tenant-exclusive operational data where isolation actually matters for scale/blast-radius?
+
+**goes in tenant schema:**
+
+- monitors, notifications, tenant-facing audit logs
+- these can get huge, and a bug querying them should never be able to leak across tenants
+
+**stays in core:**
+
+- payments/plans — low volume (dozens of rows per tenant per year, not thousands)
+- you (the platform) always need cross-tenant visibility into billing anyway, so there's no isolation benefit to splitting it
+
+### concrete split
+
+```sql
+-- core: identity, tenancy, billing
+core.users
+core.accounts
+core.refresh_tokens
+core.tenants
+core.tenant_members
+core.tenant_invites
+core.plans
+core.subscriptions
+
+-- tenant_acmecorp: per-tenant product data
+tenant_acmecorp.monitors
+tenant_acmecorp.checks
+tenant_acmecorp.alerts
+```
+
+### dual-table mirror pattern
+
+one subtlety: some concepts split into TWO tables, one in each schema, because two different consumers ask two different questions about the same event. a monitor going down might write:
+
+- a row in `tenant_acmecorp.notifications` — "your monitor is down", for that tenant's own team
+- optionally a row in `core.platform_events` — "tenant acme had a monitor go down", only if you actually want superadmin cross-tenant visibility into that event type
+
+you don't build the core mirror for everything, only for the specific things you've decided the platform operator legitimately needs to see. just because data is technically reachable doesn't mean it should be reachable — the platform operator's job is "is the platform healthy", not "let me browse what acme corp is monitoring". design should make the wrong thing structurally awkward, not just policy-forbidden.
+
+---
+
+## tenants table + status-driven provisioning
+
+```sql
+CREATE TABLE core.tenants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug VARCHAR(63) UNIQUE NOT NULL CHECK (slug ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    name VARCHAR(255) NOT NULL,
+    owner_user_id UUID NOT NULL REFERENCES core.users(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'provisioning', 'active', 'failed')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_tenants_owner_user_id ON core.tenants(owner_user_id);
+```
+
+### slug rules
+
+**regex breakdown:**
+
+- starts alphanumeric, middle allows hyphens, ends alphanumeric, 1-63 chars
+- 63 isn't arbitrary — it's the actual DNS label length limit
+- no leading/trailing hyphens because `-acme.domain.com` or `acme-.domain.com` would be a broken subdomain
+
+**uniqueness:**
+
+- enforced by the UNIQUE constraint — if taken, reject and ask the user to pick another
+- do NOT auto-suffix (acme -> acme-2) — that's bad ux for something that becomes a permanent, user-facing url
+
+**reserved words:**
+
+- api, admin, www, internal, app — not handled by the regex, that's a semantic check, not a format check
+- keep a denylist in application code and check it before insert, since the list will grow and you don't want a migration every time you think of a new reserved word
+
+### status-driven provisioning
+
+status column drives the whole provisioning flow:
+
+1. user submits onboarding -> INSERT tenants row, status='pending' (always succeeds, just a row insert)
+2. provisioning step runs -> status='provisioning', runs CREATE SCHEMA + migrations inside a transaction
+3. success -> status='active'
+4. failure -> transaction rolls back (no orphaned half-migrated schema), status='failed', error logged
+
+**retrying failed provisions:**
+
+- anything with status='failed' (or stuck in 'provisioning' past some timeout) is safe to retry
+- the transaction rollback guarantees there's no partial state to conflict with
+- the transaction is what makes retries SAFE
+- the status column is what makes retries POSSIBLE — something has to know it should retry
+
+### why varchar not enum
+
+used VARCHAR + CHECK instead of a postgres ENUM here on purpose:
+
+- enum alterations can't run inside a transaction in some postgres versions
+- status is exactly the kind of column that'll grow new values over time
+- CHECK constraints are just easier to alter later
+
+---
+
+## tenant_members: why not just tenant_id on users
+
+a user can belong to zero, one, or many tenants, with a DIFFERENT role in each. if role lived on core.users directly, one column could only ever hold one value — can't represent "alice is owner of acme, member of beta inc" with a single column.
+
+```sql
+CREATE TABLE core.tenant_members (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES core.users(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE(tenant_id, user_id)
+);
+
+CREATE INDEX idx_tenant_members_tenant_id ON core.tenant_members(tenant_id);
+CREATE INDEX idx_tenant_members_user_id ON core.tenant_members(user_id);
+```
+
+**key points:**
+
+- `UNIQUE(tenant_id, user_id)` is what actually enforces one role per person per tenant — without it you could get duplicate/conflicting membership rows
+- this is also fundamentally a many-to-many join table (many users to many tenants), and join tables almost never belong inside either side's own schema — they're not owned by either side, they connect them, so they live in the shared layer (core) by definition
+- 'owner' is never granted through the regular invite flow — see tenant_invites below for why
+- tenant creation flow inserts exactly one tenant_members row with role='owner' for whoever created it, at creation time, alongside the tenants insert
+
+---
+
+## tenant_invites: separate table, not a column on tenants
+
+first instinct might be "just add an invite_code column to tenants" — wrong, because:
+
+- a tenant needs MULTIPLE, independently revocable, independently expirable invites at once (invite a dev, invite a teammate, an old link leaks and you want to kill just that one)
+- a single column can't represent "many active invites simultaneously" any more than a single role column on users could represent per-tenant roles
+- same shape of mistake, same fix — separate table
+
+```sql
+CREATE TABLE core.tenant_invites (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES core.tenants(id) ON DELETE CASCADE,
+    code VARCHAR(64) UNIQUE NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')), -- no 'owner' here on purpose
+    invited_by UUID NOT NULL REFERENCES core.users(id),
+    max_uses INT NOT NULL DEFAULT 1,
+    uses_count INT NOT NULL DEFAULT 0,
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_tenant_invites_tenant_id ON core.tenant_invites(tenant_id);
+```
+
+### why no owner on invites
+
+- ownership is assigned once, at tenant creation, tied to "who provisioned this workspace"
+- if invites could grant owner, a tenant could end up with multiple ambiguous owners, or the creator could accidentally hand ownership to someone via a link that gets forwarded around
+- ownership transfer, if you ever build it, should be a deliberate separate action requiring the current owner's explicit confirmation — not a side effect of a generic shareable invite link
+
+### invited_by
+
+`invited_by` is for accountability/audit — who let this person in.
+
+### redeeming an invite
+
+```sql
+-- name: GetInviteByCode :one
+SELECT * FROM core.tenant_invites
+WHERE code = $1
+  AND revoked = false
+  AND expires_at > now()
+  AND uses_count < max_uses;
+```
+
+note all the validity conditions (not revoked, not expired, not maxed out) are baked into the WHERE clause itself, not checked afterward in app code. "no rows returned" already means "invalid invite" — one less place to forget a check.
+
+---
+
+## subdomain routing — one app, not separate projects per subdomain
+
+### the mental model
+
+the mental trap here: it's easy to picture `mydomain.com` and `acmecorp.mydomain.com` as two different apps/deployments. they're not. it's the SAME running process, same code, same build. the app just reads the `Host` header off every incoming request as one more piece of input — same as it reads the url path or query params.
+
+### how it works
+
+- DNS wildcard (`*.mydomain.com` -> your app's IP) makes every possible subdomain land on the same server
+- middleware is what makes `acmecorp.` "feel like" a different space than `betainc.` — it's the same code checking a Host header and deciding what to query, not different code running
+
+```go
+func TenantResolutionMiddleware() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        host := c.Request.Host
+
+        if host == "internal.mydomain.com" {
+            c.Set("route_type", "admin")
+            c.Next()
+            return
+        }
+
+        subdomain := extractSubdomain(host)
+        if subdomain == "" {
+            c.Set("route_type", "root") // mydomain.com itself
+            c.Next()
+            return
+        }
+
+        // look up tenant by slug, set search_path
+        c.Set("route_type", "tenant")
+        c.Set("tenant_slug", subdomain)
+        c.Next()
+    }
+}
+```
+
+### local dev
+
+local dev subdomains: `*.localhost` or `*.localtest.me` both resolve to 127.0.0.1 with zero /etc/hosts editing. same backend process/port serves every tenant locally too, same as prod.
+
+---
+
+## cookies across subdomains
+
+set cookies with `Domain=.mydomain.com` (leading dot matters) instead of leaving domain unset.
+
+a cookie scoped this way is sent by the browser on requests to:
+
+- `mydomain.com`
+- `acmecorp.mydomain.com`
+- `internal.mydomain.com`
+- any subdomain under the domain
+
+one login, one cookie, valid everywhere under the domain. no re-login per subdomain, no session-passing trickery needed.
+
+---
+
+## superadmin panel: role check, not a schema or a membership table
+
+`internal.mydomain.com` is NOT a tenant, and tenant_members is the wrong table to gate access to it:
+
+- there's no tenant_id to put in that row
+- the admin panel is a cross-cutting view over ALL tenants, not scoped to any single one
+
+the actual mechanism is just a platform-level role column on core.users:
+
+```sql
+ALTER TABLE core.users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'superadmin'));
+```
+
+```go
+func RequireSuperadmin() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        userID := c.GetString("user_id")
+        user, err := queries.GetUserByID(ctx, userID)
+        if err != nil || user.Role != "superadmin" {
+            c.AbortWithStatus(http.StatusForbidden)
+            return
+        }
+        c.Next()
+    }
+}
+```
+
+### what if a regular user hits it
+
+what happens if a regular authenticated user (valid cookie, role='user') hits internal.mydomain.com:
+
+- NOT a security incident, don't clear their cookies or force logout — that punishes someone for typo/curiosity who didn't get past anything
+- just 403, or redirect somewhere sensible (root domain, or their own tenant dashboard)
+- same shape as any other RequireX role guard anywhere else in the app
+
+---
+
+## connection pooling gotcha — the trickiest part of schema-per-tenant
+
+### the problem
+
+postgres does NOT auto-reset `search_path` between requests when using a connection pool:
+
+- if you `SET search_path = tenant_acme` on a pooled connection and then release it back to the pool without resetting, the NEXT request that borrows that same connection could silently inherit the wrong tenant's search_path
+
+### the fix
+
+- reset search_path at the start (or end) of every request/transaction, never assume it persists correctly across borrowed connections
+- with pgx pool specifically — acquire a connection, set search_path in the same transaction/session, run the query, release
+- never set it once globally and trust it stays clean
+
+---
+
+## queue/worker for the monitoring engine — not one cron job per monitor
+
+### wrong vs right pattern
+
+- **wrong:** literal per-monitor cron jobs
+- **right:** one lightweight scheduler process that checks "what's due right now", pushes jobs into a queue, a shared worker pool pulls and executes them
+
+### asynq vs rabbitmq
+
+went with asynq (redis-backed, go-native) over rabbitmq:
+
+- rabbitmq is a message BROKER — built around exchanges and routing, for when multiple independent services need to react to the same event differently
+- asynq is a task QUEUE — enqueue a job, a worker picks it up, runs it, done, with retries/backoff built in
+- for "run a check every N minutes", that's asynq's exact use case, not rabbitmq's
+- rabbitmq earns its complexity when you have multiple services fanning out from one event — not here
+
+### live results to the dashboard
+
+cron/worker writes result -> publishes to redis pub/sub -> websocket server pushes to connected clients.
+
+pub/sub specifically matters for horizontal scaling — if you have multiple server instances, pub/sub is how a result written by one instance's worker reaches a websocket connection sitting on a different instance.
