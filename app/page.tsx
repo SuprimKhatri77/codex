@@ -51,6 +51,17 @@ const notes = [
       },
     ],
   },
+  {
+    section: "Architecture",
+    items: [
+      {
+        slug: "/architecture",
+        tag: "architecture",
+        title: "Architecture notes",
+        desc: "core architecture patterns, design principles, best practices",
+      },
+    ],
+  },
 ];
 
 export default function Home() {

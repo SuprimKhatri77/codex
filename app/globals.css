@@ -209,4 +209,12 @@
   code {
     @apply transition-colors duration-300 ease-in-out;
   }
+
+  :not(pre) > code {
+    @apply font-mono text-[12px] text-cx-accent bg-cx-tag border border-cx-border-subtle px-1.5 py-0.5 rounded-sm;
+  }
+
+  pre code {
+    @apply bg-transparent border-0 p-0 rounded-none text-inherit;
+  }
 }
