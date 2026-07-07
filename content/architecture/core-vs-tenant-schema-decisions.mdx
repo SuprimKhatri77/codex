@@ -1,0 +1,90 @@
+---
+title: core vs tenant schema — how to decide where a table goes
+desc: the actual test for whether a table belongs in the shared core schema or inside each tenant's own schema, worked through with real examples (payments, monitors, notifications, audit logs)
+tag: architecture
+---
+
+## the wrong test
+
+"is this data related to a tenant" — almost everything is, in some sense, so this test never actually rules anything out. same with "could i technically filter this by tenant_id" — true of nearly every table you'll ever write, so it doesn't discriminate either.
+
+a table's NAME also doesn't decide where it lives. tenant_members and tenant_invites are both prefixed "tenant" and both live in core — the prefix describes what the table is ABOUT, not where it's placed. naming convention and schema placement are separate decisions.
+
+## the actual test, two parts
+
+**part 1 — can this be queried using something already in hand, without first knowing the tenant?**
+
+can this row be found using the user's own user_id, an invite code, a slug — something the caller already has — WITHOUT needing to already know which tenant's schema to look in? if yes, it has to be core, because the whole point of the query is often to DISCOVER the tenant in the first place.
+
+example that fails this test (belongs in core): "which tenants does user X belong to" — needed at login time, before ANY tenant context is resolved. if tenant_members lived inside each tenant_xyz schema, answering this would mean querying every tenant schema in the database looking for a match. that's not just slow, it defeats the entire purpose of the isolation.
+
+same for invite codes — a user clicks a link with just a code, no tenant context exists yet. the code is what LEADS you to the tenant, so the table holding it can't itself live inside that tenant's schema.
+
+**part 2 — for things where you already know the tenant either way, is this high-volume + tenant-exclusive, where isolation matters for scale or blast-radius?**
+
+if a table passes part 1 either way (you'd always know the tenant before querying it), ask: does this table grow large per-tenant, and does a bug here have any business leaking across tenants? if yes -> tenant schema. if it's low-volume and the platform legitimately needs cross-tenant visibility into it anyway (no isolation benefit from splitting it) -> core.
+
+## worked example: payments/plans (core, not split)
+
+a subscription is billed to the TENANT as a single unit — one stripe customer, one payment method, no "per-user-within-tenant" version of a payment the way there's a per-user notification. there's no natural tenant-schema-side half to split off, because the tenant doesn't have its own meaningfully-different view of its own billing.
+
+volume check: ~100 tenants x 12 payments/year = ~1200 rows/year total. tiny. no isolation benefit either — you (the platform) are the one party who ALWAYS needs cross-tenant visibility into billing, by nature of being the one collecting the money. one table, queried two ways:
+
+```sql
+-- tenant's own owner viewing their billing page
+SELECT * FROM core.subscriptions WHERE tenant_id = 'acme-uuid';
+
+-- platform-wide revenue view
+SELECT * FROM core.subscriptions;
+```
+
+same table, different WHERE clause depending on who's asking. this isn't "core has a duplicate of tenant data" — it's literally the same single fact with two query angles. not the same as a genuine duplication case.
+
+## worked example: monitors (tenant schema, not core)
+
+a single tenant's monitor configs are: business logic that belongs entirely to that tenant, checked constantly by a scheduler (every N seconds), high volume over time (could be thousands of rows), and queried almost exclusively from within that tenant's own already-resolved request context (their dashboard, their api calls).
+
+this is exactly the workload schema-per-tenant isolation exists for. does the platform operator have a legitimate reason to browse all tenants' monitor configs across the whole platform? no — the platform operator's job is "is the platform healthy" (uptime of your own infra, provisioning failures, billing), not "let me casually see what acme corp happens to be monitoring." just because data is technically reachable if you removed the schema boundary doesn't mean it should be reachable. good design should make the wrong thing structurally awkward, not just policy-forbidden — like a house where the builder didn't wire cameras into every room just because they technically could, rather than relying on a rule saying "please don't look."
+
+## worked example: notifications and audit logs (BOTH — split into two tables, not one)
+
+these are the trickiest because the same triggering event can matter to two totally different audiences asking two totally different questions. don't try to force one table to serve both.
+
+"tenant admin views their own team's activity" -> tenant schema. always queried from an already-resolved tenant context, high volume per tenant, no reason for it to be visible platform-wide.
+
+"platform operator wants to see all provisioning failures across every tenant today" or "notify me when ANY tenant's payment fails" -> core. this is inherently a cross-tenant question — there's no single tenant schema to look in, since the whole point is spanning many or none.
+
+so: one monitor going down might write BOTH:
+
+- a row in `tenant_acmecorp.notifications` — "your monitor is down" — for that tenant's own team
+- optionally a row in `core.platform_events` — "tenant acme had a monitor go down" — ONLY for the specific event types you've deliberately decided the platform operator needs visibility into
+
+you don't build the core mirror for every event type, only the ones you've actually decided warrant platform-wide monitoring (provisioning failures, payment failures, uptime-engine health — not every routine tenant-level notification).
+
+## the general pattern to reuse
+
+whenever a new table feels ambiguous, ask in this order:
+
+1. who is the actual CONSUMER of this data, and what's their vantage point when they query it — a tenant's own user (always already inside a resolved tenant context) or the platform operator (inherently above/across tenants)?
+2. can this be queried before a tenant is even known (discovery-type data)? if yes, core, no exceptions.
+3. if it's clearly tenant-scoped either way, is it high-volume and does isolation actually reduce blast-radius risk? if yes, tenant schema. if it's low-volume and the platform needs cross-tenant visibility anyway, core.
+4. if the SAME underlying event genuinely matters to both audiences in different shapes, don't force one table — write two, one per schema, and only build the core-side one for the specific events you've deliberately decided warrant platform-wide visibility.
+
+same event, two rows, two audiences is fine and normal. one ambiguous table trying to serve both is the actual mistake to avoid.
+
+## rls as a related but orthogonal tool (didn't end up needing it)
+
+row-level security (RLS) is a postgres feature where a policy attached to a table auto-applies an invisible extra WHERE clause to every query, based on the current session/role:
+
+```sql
+ALTER TABLE tenant_data ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON tenant_data
+    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+```
+
+genuinely useful as defense-in-depth for SHARED-TABLE, tenant_id-column architectures — even if application code forgets a WHERE clause somewhere, RLS is a database-enforced backstop.
+
+doesn't inherently lock out admins — postgres has a BYPASSRLS role attribute specifically for superuser/admin connections to skip RLS entirely, and you can write policies that allow a bypass role. the "would this lock me out of my own data" worry is a config risk (forgetting the bypass), not a fundamental limitation of the feature.
+
+not needed here specifically because schema-per-tenant + search_path already gives hard isolation for free — there's no shared table for a bug to leak from in the first place, since tenant_xyz schemas are structurally separate. RLS earns its keep in the shared-schema pattern (which is why neon/supabase, who lean toward that pattern, push it) — not really additive on top of a design that already isolates via separate schemas.

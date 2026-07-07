@@ -67,7 +67,7 @@ export default function TableOfContents({ content }: { content: string }) {
         </p>
         <ul
           ref={listRef}
-          className="overflow-y-auto overscroll-contain pr-3 -mr-1 space-y-0.5"
+          className="flex-1 min-h-0 overflow-y-auto overscroll-contain pr-3 -mr-1 space-y-0.5"
         >
           {headings.map((h, idx) => {
             const isH2 = h.level === 2;
